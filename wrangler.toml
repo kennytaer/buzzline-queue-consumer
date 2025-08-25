@@ -16,9 +16,14 @@ id = "45f26618ca3042ee8c90df3ac3b5ff2b"
 binding = "BUZZLINE_CACHE"
 id = "951b33a733c446378409d0825256c060"
 
-# Queue consumer
+# Queue consumer - Conservative batching to guarantee KV limit compliance
 [[queues.consumers]]
 queue = "contact-processing-queue"
-max_batch_size = 100
-max_batch_timeout = 5
-max_retries = 3
+max_batch_size = 50               # Very conservative: 50 * 5 ops = 250 (leaves 750 buffer)
+max_batch_timeout = 2             # Faster processing of smaller batches
+max_retries = 2                   # Reduced from 3 (faster failure recovery) 
+max_concurrency = 20              # Can increase since batches are much smaller
+
+# wrangler.toml (wrangler v3.88.0^)
+[observability.logs]
+enabled = true
