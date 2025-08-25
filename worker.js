@@ -357,15 +357,32 @@ async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId,
 
 export default {
   async queue(batch, env, ctx) {
-    console.log('🚀 QUEUE WORKER - Processing batch:', {
-      messageCount: batch.length
+    console.log('🚀 QUEUE WORKER - Processing MessageBatch:', {
+      batchKeys: Object.keys(batch),
+      queueName: batch.queue,
+      messageCount: batch.messages?.length || 0
     });
 
     const kvService = new KVService(env);
     kvService.env = env; // Store env reference for contact service
 
-    for (const message of batch) {
-      await processContactBatch(message.body, kvService);
+    // Access messages from batch.messages (Cloudflare Queue format)
+    const messages = batch.messages || [];
+    
+    for (const message of messages) {
+      try {
+        if (message.body) {
+          await processContactBatch(message.body, kvService);
+          // Acknowledge successful processing
+          message.ack();
+        } else {
+          console.error('❌ QUEUE WORKER - Message missing body:', message);
+          message.retry();
+        }
+      } catch (error) {
+        console.error(`❌ QUEUE WORKER - Failed to process message ${message.id}:`, error);
+        message.retry();
+      }
     }
   }
 };
