@@ -19,6 +19,6 @@ id = "951b33a733c446378409d0825256c060"
 # Queue consumer
 [[queues.consumers]]
 queue = "contact-processing-queue"
-max_batch_size = 1
+max_batch_size = 100
 max_batch_timeout = 5
 max_retries = 3
