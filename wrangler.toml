@@ -1,0 +1,24 @@
+name = "buzzline-queue-consumer"
+main = "worker.js"
+compatibility_date = "2024-10-15"
+compatibility_flags = ["nodejs_compat"]
+
+# KV Namespaces (same as your main project)
+[[kv_namespaces]]
+binding = "BUZZLINE_MAIN"
+id = "365db24eb7d647acb6e3fc39d38acd25"
+
+[[kv_namespaces]]
+binding = "BUZZLINE_ANALYTICS"
+id = "45f26618ca3042ee8c90df3ac3b5ff2b"
+
+[[kv_namespaces]]
+binding = "BUZZLINE_CACHE"
+id = "951b33a733c446378409d0825256c060"
+
+# Queue consumer
+[[queues.consumers]]
+queue = "contact-processing-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+max_retries = 3
