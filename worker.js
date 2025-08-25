@@ -490,34 +490,56 @@ export default {
     // Access messages from batch.messages (Cloudflare Queue format)
     const messages = batch.messages || [];
     
-    // Process messages in parallel with controlled concurrency
-    const MESSAGE_CONCURRENCY = 5; // Process up to 5 messages concurrently
+    let processedCount = 0;
+    let errorCount = 0;
     
-    for (let i = 0; i < messages.length; i += MESSAGE_CONCURRENCY) {
-      const messageBatch = messages.slice(i, i + MESSAGE_CONCURRENCY);
-      
-      const messagePromises = messageBatch.map(async (message) => {
-        try {
-          if (message.body) {
-            await processContactBatch(message.body, kvService);
-            message.ack();
-            return { success: true, messageId: message.id };
-          } else {
-            console.error('❌ QUEUE WORKER - Message missing body:', message);
-            message.retry();
-            return { success: false, messageId: message.id, error: 'Missing body' };
-          }
-        } catch (error) {
-          console.error(`❌ QUEUE WORKER - Failed to process message ${message.id}:`, error);
+    // Process messages SEQUENTIALLY to avoid KV operation overlap
+    // This prevents multiple contact batches from hitting KV limit simultaneously
+    for (const message of messages) {
+      try {
+        if (!message.body) {
+          console.error('❌ QUEUE WORKER - Message missing body:', message.id);
           message.retry();
-          return { success: false, messageId: message.id, error: error.message };
+          errorCount++;
+          continue;
         }
-      });
-      
-      await Promise.allSettled(messagePromises);
+        
+        // Check if we have enough KV operations left for this message
+        const estimatedOpsNeeded = (message.body.contacts?.length || 0) * 5;
+        if (kvService.operationCount + estimatedOpsNeeded > kvService.maxOperations) {
+          console.warn(`⚠️ QUEUE WORKER - KV limit would be exceeded for message ${message.id}, retrying`);
+          message.retry();
+          errorCount++;
+          continue;
+        }
+        
+        console.log(`📫 Processing message ${message.id} (${message.body.contacts?.length || 0} contacts)`);
+        await processContactBatch(message.body, kvService);
+        
+        // Acknowledge successful processing
+        message.ack();
+        processedCount++;
+        
+        console.log(`✅ Message ${message.id} completed - KV ops: ${kvService.operationCount}/${kvService.maxOperations}`);
+        
+      } catch (error) {
+        console.error(`❌ QUEUE WORKER - Failed to process message ${message.id}:`, error);
+        // Individual message retry - won't affect other messages
+        message.retry();
+        errorCount++;
+      }
     }
     
     const processingTime = Date.now() - startTime;
-    console.log(`✅ QUEUE WORKER - Batch completed in ${processingTime}ms (${messages.length} messages)`);
+    console.log(`✅ QUEUE WORKER - Batch completed:`, {
+      totalMessages: messages.length,
+      processed: processedCount,
+      errors: errorCount,
+      processingTime: `${processingTime}ms`,
+      kvOperationsUsed: kvService.operationCount,
+      kvOperationsRemaining: kvService.maxOperations - kvService.operationCount
+    });
+    
+    // Don't throw errors - we handled everything individually
   }
 };
