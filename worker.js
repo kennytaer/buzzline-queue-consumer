@@ -1,7 +1,158 @@
-// Queue consumer worker for BuzzLine
-import { getContactService } from './app/lib/services/contact.server.js';
-import { getContactListService } from './app/lib/services/contactlist.server.js';
-import { getKVService } from './app/lib/kv.server.js';
+// Queue consumer worker for BuzzLine - Self-contained version
+
+// Simplified KV service for the worker
+class KVService {
+  constructor(env) {
+    this.main = env.BUZZLINE_MAIN;
+    this.cache = env.BUZZLINE_CACHE;
+    this.analytics = env.BUZZLINE_ANALYTICS;
+  }
+
+  async getCache(key) {
+    try {
+      const result = await this.cache.get(key);
+      return result ? JSON.parse(result) : null;
+    } catch (error) {
+      console.error('KV get error:', error);
+      return null;
+    }
+  }
+
+  async setCache(key, value, ttl = 3600) {
+    try {
+      await this.cache.put(key, JSON.stringify(value), { expirationTtl: ttl });
+    } catch (error) {
+      console.error('KV set error:', error);
+    }
+  }
+
+  async get(key) {
+    try {
+      const result = await this.main.get(key);
+      return result ? JSON.parse(result) : null;
+    } catch (error) {
+      console.error('KV main get error:', error);
+      return null;
+    }
+  }
+
+  async put(key, value) {
+    try {
+      await this.main.put(key, JSON.stringify(value));
+    } catch (error) {
+      console.error('KV main put error:', error);
+    }
+  }
+}
+
+// Simplified contact service for the worker
+class ContactService {
+  constructor(env) {
+    this.kv = new KVService(env);
+  }
+
+  async findContactsByEmailsOrPhones(orgId, emailsAndPhones) {
+    try {
+      const contacts = [];
+      for (const { email, phone } of emailsAndPhones) {
+        if (email) {
+          const emailKey = `org:${orgId}:contact_by_email:${email.toLowerCase()}`;
+          const contact = await this.kv.get(emailKey);
+          if (contact) contacts.push({ email, contact });
+        }
+        if (phone) {
+          const phoneKey = `org:${orgId}:contact_by_phone:${phone}`;
+          const contact = await this.kv.get(phoneKey);
+          if (contact) contacts.push({ phone, contact });
+        }
+      }
+      return contacts;
+    } catch (error) {
+      console.error('Error finding contacts:', error);
+      return [];
+    }
+  }
+
+  async createContactsBulk(orgId, contacts) {
+    const created = [];
+    const errors = [];
+
+    for (const { id, data } of contacts) {
+      try {
+        const contact = {
+          id,
+          orgId,
+          ...data,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        };
+
+        // Store main contact record
+        const contactKey = `org:${orgId}:contact:${id}`;
+        await this.kv.put(contactKey, contact);
+
+        // Store email index if exists
+        if (contact.email) {
+          const emailKey = `org:${orgId}:contact_by_email:${contact.email.toLowerCase()}`;
+          await this.kv.put(emailKey, contact);
+        }
+
+        // Store phone index if exists
+        if (contact.phone) {
+          const phoneKey = `org:${orgId}:contact_by_phone:${contact.phone}`;
+          await this.kv.put(phoneKey, contact);
+        }
+
+        created.push(contact);
+      } catch (error) {
+        console.error(`Failed to create contact ${id}:`, error);
+        errors.push({ id, error: error.message });
+      }
+    }
+
+    return { created, errors };
+  }
+
+  async updateContact(orgId, contactId, updates) {
+    try {
+      const contactKey = `org:${orgId}:contact:${contactId}`;
+      const existing = await this.kv.get(contactKey);
+      
+      if (!existing) {
+        throw new Error('Contact not found');
+      }
+
+      const updated = {
+        ...existing,
+        ...updates,
+        updatedAt: new Date().toISOString()
+      };
+
+      await this.kv.put(contactKey, updated);
+
+      // Update indexes if email/phone changed
+      if (updates.email && updates.email !== existing.email) {
+        const emailKey = `org:${orgId}:contact_by_email:${updates.email.toLowerCase()}`;
+        await this.kv.put(emailKey, updated);
+      }
+
+      if (updates.phone && updates.phone !== existing.phone) {
+        const phoneKey = `org:${orgId}:contact_by_phone:${updates.phone}`;
+        await this.kv.put(phoneKey, updated);
+      }
+
+      return updated;
+    } catch (error) {
+      console.error(`Failed to update contact ${contactId}:`, error);
+      throw error;
+    }
+  }
+
+  async forceRebuildMetadata(orgId) {
+    console.log(`Rebuilding metadata for org ${orgId} - simplified version`);
+    // For now, just log. In full version, this would rebuild search indexes
+  }
+}
 
 async function processContactBatch(message, kvService) {
   const { uploadId, orgId, listId, listName, batchNumber, totalBatches, contacts, reactivateDuplicates } = message;
@@ -9,8 +160,7 @@ async function processContactBatch(message, kvService) {
   console.log(`📦 WORKER BATCH ${batchNumber}/${totalBatches} - Processing ${contacts.length} contacts for upload ${uploadId}`);
   
   try {
-    const contactService = getContactService({ cloudflare: { env: {} } });
-    const contactListService = getContactListService({ cloudflare: { env: {} } });
+    const contactService = new ContactService(kvService.env);
     
     // Update status to show this batch is processing
     await updateBatchStatus(kvService, orgId, uploadId, batchNumber, 'processing', {
@@ -211,7 +361,8 @@ export default {
       messageCount: batch.length
     });
 
-    const kvService = getKVService({ cloudflare: { env } });
+    const kvService = new KVService(env);
+    kvService.env = env; // Store env reference for contact service
 
     for (const message of batch) {
       await processContactBatch(message.body, kvService);
