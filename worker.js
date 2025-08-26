@@ -137,18 +137,18 @@ class ContactService {
           
           // Store main contact record
           const contactKey = `org:${orgId}:contact:${id}`;
-          kvOperations.push(this.kv.put(contactKey, contact));
+          kvOperations.push(this.kv.put(contactKey, JSON.stringify(contact)));
 
           // Store email index if exists
           if (contact.email) {
             const emailKey = `org:${orgId}:contact_by_email:${contact.email.toLowerCase()}`;
-            kvOperations.push(this.kv.put(emailKey, contact));
+            kvOperations.push(this.kv.put(emailKey, JSON.stringify(contact)));
           }
 
           // Store phone index if exists
           if (contact.phone) {
             const phoneKey = `org:${orgId}:contact_by_phone:${contact.phone}`;
-            kvOperations.push(this.kv.put(phoneKey, contact));
+            kvOperations.push(this.kv.put(phoneKey, JSON.stringify(contact)));
           }
           
           // Execute all KV operations for this contact in parallel
