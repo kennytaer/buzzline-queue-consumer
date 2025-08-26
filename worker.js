@@ -73,13 +73,210 @@ class KVService {
 const MESSAGE_TYPES = {
   CONTACT_BATCH: 'contact_batch',
   CAMPAIGN_SEND: 'campaign_send', 
-  CONTACT_DELETE: 'contact_delete'
+  CONTACT_DELETE: 'contact_delete',
+  OPT_OUT_BATCH: 'opt_out_batch'
 };
+
+// Contact metadata management
+class ContactMetadataService {
+  constructor(kvService) {
+    this.kv = kvService;
+  }
+  
+  // Get or initialize contact metadata for an organization
+  async getContactMetadata(orgId) {
+    const metaKey = `org:${orgId}:contact_metadata`;
+    const metadata = await this.kv.get(metaKey);
+    
+    if (metadata) {
+      return metadata;
+    }
+    
+    // Initialize metadata if it doesn't exist
+    const initialMetadata = {
+      totalContacts: 0,
+      contactsWithEmail: 0,
+      contactsWithPhone: 0,
+      contactsWithBoth: 0,
+      subscribedContacts: 0,
+      optedOutContacts: 0,
+      lastUpdated: new Date().toISOString(),
+      version: 1
+    };
+    
+    await this.kv.put(metaKey, initialMetadata);
+    return initialMetadata;
+  }
+  
+  // Update contact metadata when contacts are added/modified/deleted
+  async updateContactMetadata(orgId, operations) {
+    const metaKey = `org:${orgId}:contact_metadata`;
+    const metadata = await this.getContactMetadata(orgId);
+    
+    // Apply operations to metadata
+    for (const op of operations) {
+      switch (op.type) {
+        case 'add':
+          this.applyAddOperation(metadata, op.contact);
+          break;
+        case 'update':
+          this.applyUpdateOperation(metadata, op.oldContact, op.newContact);
+          break;
+        case 'delete':
+          this.applyDeleteOperation(metadata, op.contact);
+          break;
+        case 'bulk_add':
+          this.applyBulkAddOperation(metadata, op.contacts);
+          break;
+        case 'bulk_delete':
+          this.applyBulkDeleteOperation(metadata, op.count);
+          break;
+      }
+    }
+    
+    metadata.lastUpdated = new Date().toISOString();
+    metadata.version += 1;
+    
+    await this.kv.put(metaKey, metadata);
+    return metadata;
+  }
+  
+  applyAddOperation(metadata, contact) {
+    metadata.totalContacts++;
+    
+    const hasEmail = contact.email && contact.email.trim();
+    const hasPhone = contact.phone && contact.phone.trim();
+    
+    if (hasEmail) metadata.contactsWithEmail++;
+    if (hasPhone) metadata.contactsWithPhone++;
+    if (hasEmail && hasPhone) metadata.contactsWithBoth++;
+    
+    if (!contact.optedOut) {
+      metadata.subscribedContacts++;
+    } else {
+      metadata.optedOutContacts++;
+    }
+  }
+  
+  applyUpdateOperation(metadata, oldContact, newContact) {
+    const oldHasEmail = oldContact.email && oldContact.email.trim();
+    const oldHasPhone = oldContact.phone && oldContact.phone.trim();
+    const newHasEmail = newContact.email && newContact.email.trim();
+    const newHasPhone = newContact.phone && newContact.phone.trim();
+    
+    // Update email counts
+    if (oldHasEmail && !newHasEmail) metadata.contactsWithEmail--;
+    if (!oldHasEmail && newHasEmail) metadata.contactsWithEmail++;
+    
+    // Update phone counts
+    if (oldHasPhone && !newHasPhone) metadata.contactsWithPhone--;
+    if (!oldHasPhone && newHasPhone) metadata.contactsWithPhone++;
+    
+    // Update both counts
+    if (oldHasEmail && oldHasPhone && !(newHasEmail && newHasPhone)) {
+      metadata.contactsWithBoth--;
+    }
+    if (!(oldHasEmail && oldHasPhone) && newHasEmail && newHasPhone) {
+      metadata.contactsWithBoth++;
+    }
+    
+    // Update subscription status
+    if (!oldContact.optedOut && newContact.optedOut) {
+      metadata.subscribedContacts--;
+      metadata.optedOutContacts++;
+    }
+    if (oldContact.optedOut && !newContact.optedOut) {
+      metadata.subscribedContacts++;
+      metadata.optedOutContacts--;
+    }
+  }
+  
+  applyDeleteOperation(metadata, contact) {
+    metadata.totalContacts--;
+    
+    const hasEmail = contact.email && contact.email.trim();
+    const hasPhone = contact.phone && contact.phone.trim();
+    
+    if (hasEmail) metadata.contactsWithEmail--;
+    if (hasPhone) metadata.contactsWithPhone--;
+    if (hasEmail && hasPhone) metadata.contactsWithBoth--;
+    
+    if (!contact.optedOut) {
+      metadata.subscribedContacts--;
+    } else {
+      metadata.optedOutContacts--;
+    }
+  }
+  
+  applyBulkAddOperation(metadata, contacts) {
+    for (const contact of contacts) {
+      this.applyAddOperation(metadata, contact);
+    }
+  }
+  
+  applyBulkDeleteOperation(metadata, deleteCount) {
+    // For bulk deletion, we reset to 0 since we're typically clearing all
+    metadata.totalContacts = 0;
+    metadata.contactsWithEmail = 0;
+    metadata.contactsWithPhone = 0;
+    metadata.contactsWithBoth = 0;
+    metadata.subscribedContacts = 0;
+    metadata.optedOutContacts = 0;
+  }
+  
+  // Rebuild metadata from scratch by scanning all contacts
+  async rebuildContactMetadata(orgId) {
+    console.log('🔄 REBUILDING CONTACT METADATA for org:', orgId);
+    
+    const prefix = `org:${orgId}:contact:`;
+    const metadata = {
+      totalContacts: 0,
+      contactsWithEmail: 0,
+      contactsWithPhone: 0,
+      contactsWithBoth: 0,
+      subscribedContacts: 0,
+      optedOutContacts: 0,
+      lastUpdated: new Date().toISOString(),
+      version: 1
+    };
+    
+    let cursor = undefined;
+    do {
+      const list = await this.kv.main.list({ prefix, limit: 1000, cursor });
+      
+      // Process contacts in this batch
+      const batchPromises = list.keys.map(async (key) => {
+        try {
+          const contactData = await this.kv.main.get(key.name);
+          return contactData ? JSON.parse(contactData) : null;
+        } catch (error) {
+          console.error('Failed to parse contact:', error);
+          return null;
+        }
+      });
+      
+      const contacts = (await Promise.all(batchPromises)).filter(Boolean);
+      
+      // Update metadata with this batch
+      this.applyBulkAddOperation(metadata, contacts);
+      
+      cursor = list.list_complete ? undefined : list.cursor;
+    } while (cursor);
+    
+    // Save rebuilt metadata
+    const metaKey = `org:${orgId}:contact_metadata`;
+    await this.kv.put(metaKey, metadata);
+    
+    console.log('✅ METADATA REBUILT:', metadata);
+    return metadata;
+  }
+}
 
 // Simplified contact service for the worker
 class ContactService {
   constructor(env) {
     this.kv = new KVService(env);
+    this.metadataService = new ContactMetadataService(this.kv);
   }
 
   async findContactsByEmailsOrPhones(orgId, emailsAndPhones) {
@@ -481,6 +678,101 @@ async function checkAndFinalizeCampaign(kvService, orgId, campaignId, totalBatch
   }
 }
 
+// Opt-out batch processor
+async function processOptOutBatch(message, kvService) {
+  const { orgId, batchNumber, totalBatches, optOuts } = message;
+  
+  console.log(`📱 OPT-OUT BATCH ${batchNumber}/${totalBatches} - Processing ${optOuts.length} opt-outs`);
+  
+  try {
+    let processedCount = 0;
+    let errorCount = 0;
+    
+    const contactService = new ContactService(kvService.env);
+    
+    // Process opt-outs in small batches to avoid rate limits
+    const OPT_OUT_BATCH_SIZE = 10;
+    
+    for (let i = 0; i < optOuts.length; i += OPT_OUT_BATCH_SIZE) {
+      const batch = optOuts.slice(i, i + OPT_OUT_BATCH_SIZE);
+      
+      const batchPromises = batch.map(async (optOut) => {
+        try {
+          const { email, phone, contactId } = optOut;
+          let contact = null;
+          
+          // Find contact by ID, email, or phone
+          if (contactId) {
+            const contactData = await kvService.get(`org:${orgId}:contact:${contactId}`);
+            contact = contactData ? { ...contactData, id: contactId } : null;
+          } else if (email || phone) {
+            // Search for contact by email/phone
+            contact = await contactService.findContactByEmailOrPhone(orgId, email, phone);
+          }
+          
+          if (contact) {
+            // Update contact opt-out status
+            const updatedContact = {
+              ...contact,
+              optedOut: true,
+              optedOutAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString()
+            };
+            
+            const contactKey = `org:${orgId}:contact:${contact.id}`;
+            await kvService.put(contactKey, updatedContact);
+            
+            // Update metadata
+            const metadataOperations = [{
+              type: 'update',
+              oldContact: contact,
+              newContact: updatedContact
+            }];
+            await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
+            
+            console.log(`✅ Opted out contact: ${contact.id} (${email || phone})`);
+            return { success: true };
+          } else {
+            console.warn(`⚠️ Contact not found for opt-out: ${email || phone}`);
+            return { success: false, error: 'Contact not found' };
+          }
+          
+        } catch (error) {
+          console.error(`❌ Failed to process opt-out:`, error);
+          return { success: false, error: error.message };
+        }
+      });
+      
+      const results = await Promise.all(batchPromises);
+      results.forEach(result => {
+        if (result.success) {
+          processedCount++;
+        } else {
+          errorCount++;
+        }
+      });
+      
+      // Small delay between batches
+      if (i + OPT_OUT_BATCH_SIZE < optOuts.length) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+    
+    console.log(`✅ OPT-OUT BATCH ${batchNumber}/${totalBatches} - Processed: ${processedCount}, Errors: ${errorCount}`);
+    
+    // Mark batch as completed
+    await updateBatchStatus(kvService, orgId, 'opt_out', batchNumber, 'completed', {
+      processed: processedCount,
+      errors: errorCount,
+      completedAt: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error(`❌ OPT-OUT BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
+    throw error;
+  }
+}
+
 // Contact deletion processor
 async function processContactDeletion(message, kvService) {
   const { orgId, batchNumber, totalBatches, contactKeys } = message;
@@ -523,6 +815,17 @@ async function processContactDeletion(message, kvService) {
     }
     
     console.log(`✅ DELETE BATCH ${batchNumber}/${totalBatches} - Deleted: ${deletedCount}, Errors: ${errorCount}`);
+    
+    // Update contact metadata for deletions (check if this is the final batch)
+    if (batchNumber === totalBatches) {
+      // For the last batch, reset metadata to 0 since we're deleting all contacts
+      const contactService = new ContactService(kvService.env);
+      const metadataOperations = [{
+        type: 'bulk_delete',
+        count: deletedCount
+      }];
+      await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
+    }
     
     // Mark batch as completed
     await updateBatchStatus(kvService, orgId, 'deletion', batchNumber, 'completed', {
@@ -703,6 +1006,13 @@ async function processContactBatch(message, kvService) {
       kvOperationsRemaining: kvService.maxOperations - kvService.operationCount
     });
     
+    // Update contact metadata for this batch
+    const metadataOperations = [{
+      type: 'bulk_add',
+      contacts: results.created
+    }];
+    await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
+    
     // Check if this was the last batch and trigger final processing
     await checkAndFinalizeBatch(kvService, contactService, orgId, uploadId, listId, totalBatches);
     
@@ -852,6 +1162,9 @@ export default {
             break;
           case MESSAGE_TYPES.CONTACT_DELETE:
             await processContactDeletion(message.body, kvService);
+            break;
+          case MESSAGE_TYPES.OPT_OUT_BATCH:
+            await processOptOutBatch(message.body, kvService);
             break;
           default:
             throw new Error(`Unknown message type: ${message.body.type}`);
