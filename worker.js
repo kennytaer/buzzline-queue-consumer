@@ -1,4 +1,5 @@
-// Queue consumer worker for BuzzLine - Self-contained version
+// Unified Queue Consumer Worker for BuzzLine
+// Handles: Contact Import, Campaign Sending, Contact Deletion
 
 // KV service with rate limit tracking
 class KVService {
@@ -67,6 +68,13 @@ class KVService {
     }
   }
 }
+
+// Message types for unified queue processing
+const MESSAGE_TYPES = {
+  CONTACT_BATCH: 'contact_batch',
+  CAMPAIGN_SEND: 'campaign_send', 
+  CONTACT_DELETE: 'contact_delete'
+};
 
 // Simplified contact service for the worker
 class ContactService {
@@ -137,18 +145,18 @@ class ContactService {
           
           // Store main contact record
           const contactKey = `org:${orgId}:contact:${id}`;
-          kvOperations.push(this.kv.put(contactKey, JSON.stringify(contact)));
+          kvOperations.push(this.kv.put(contactKey, contact));
 
           // Store email index if exists
           if (contact.email) {
             const emailKey = `org:${orgId}:contact_by_email:${contact.email.toLowerCase()}`;
-            kvOperations.push(this.kv.put(emailKey, JSON.stringify(contact)));
+            kvOperations.push(this.kv.put(emailKey, contact));
           }
 
           // Store phone index if exists
           if (contact.phone) {
             const phoneKey = `org:${orgId}:contact_by_phone:${contact.phone}`;
-            kvOperations.push(this.kv.put(phoneKey, JSON.stringify(contact)));
+            kvOperations.push(this.kv.put(phoneKey, contact));
           }
           
           // Execute all KV operations for this contact in parallel
@@ -223,6 +231,309 @@ class ContactService {
   async forceRebuildMetadata(orgId) {
     console.log(`Rebuilding metadata for org ${orgId} - simplified version`);
     // For now, just log. In full version, this would rebuild search indexes
+  }
+}
+
+// Campaign sending processor
+async function processCampaignBatch(message, kvService) {
+  const { 
+    campaignId, orgId, batchNumber, totalBatches, contacts, 
+    campaign, salesMembers = [], messagingEndpoints = {} 
+  } = message;
+  
+  console.log(`📧 CAMPAIGN BATCH ${batchNumber}/${totalBatches} - Processing ${contacts.length} contacts for campaign ${campaignId}`);
+  
+  try {
+    const results = {
+      sent: 0,
+      failed: 0,
+      errors: []
+    };
+    
+    // Process contacts in smaller batches to avoid overwhelming external APIs
+    const SEND_BATCH_SIZE = 5; // Very conservative for API limits
+    
+    for (let i = 0; i < contacts.length; i += SEND_BATCH_SIZE) {
+      const batch = contacts.slice(i, i + SEND_BATCH_SIZE);
+      
+      const batchPromises = batch.map(async (contact, index) => {
+        try {
+          // Skip opted-out contacts
+          if (contact.optedOut) {
+            console.log(`📧 Skipping opted-out contact: ${contact.id}`);
+            return { success: true, skipped: true };
+          }
+          
+          // Get sales member for this contact if applicable
+          let salesMember = null;
+          if (campaign.campaignType === 'sales' && salesMembers.length > 0) {
+            salesMember = salesMembers[(i + index) % salesMembers.length]; // Round robin
+          }
+          
+          const sendPromises = [];
+          
+          // Send email if campaign includes email
+          if ((campaign.type === 'email' || campaign.type === 'both') && 
+              campaign.emailTemplate && contact.email) {
+            sendPromises.push(
+              sendEmail(contact, campaign, salesMember, messagingEndpoints.email)
+            );
+          }
+          
+          // Send SMS if campaign includes SMS
+          if ((campaign.type === 'sms' || campaign.type === 'both') && 
+              campaign.smsTemplate && contact.phone) {
+            sendPromises.push(
+              sendSMS(contact, campaign, salesMember, messagingEndpoints.sms)
+            );
+          }
+          
+          await Promise.all(sendPromises);
+          
+          // Track delivery in KV
+          await trackCampaignDelivery(kvService, orgId, campaignId, contact.id, {
+            sentAt: new Date().toISOString(),
+            status: 'sent',
+            channels: campaign.type
+          });
+          
+          return { success: true };
+          
+        } catch (error) {
+          console.error(`📧 Failed to send campaign to contact ${contact.id}:`, error);
+          return { 
+            success: false, 
+            contactId: contact.id, 
+            error: error.message 
+          };
+        }
+      });
+      
+      const batchResults = await Promise.all(batchPromises);
+      
+      // Process results
+      batchResults.forEach(result => {
+        if (result.success && !result.skipped) {
+          results.sent++;
+        } else if (!result.success) {
+          results.failed++;
+          results.errors.push({
+            contactId: result.contactId,
+            error: result.error
+          });
+        }
+      });
+      
+      // Delay between send batches to respect API limits
+      if (i + SEND_BATCH_SIZE < contacts.length) {
+        await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay
+      }
+    }
+    
+    // Update batch status
+    await updateBatchStatus(kvService, orgId, `campaign_${campaignId}`, batchNumber, 'completed', {
+      sent: results.sent,
+      failed: results.failed,
+      errors: results.errors.length,
+      completedAt: new Date().toISOString()
+    });
+    
+    console.log(`✅ CAMPAIGN BATCH ${batchNumber}/${totalBatches} - Completed:`, results);
+    
+    // Check if this was the last batch and finalize campaign
+    await checkAndFinalizeCampaign(kvService, orgId, campaignId, totalBatches);
+    
+  } catch (error) {
+    console.error(`❌ CAMPAIGN BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
+    
+    await updateBatchStatus(kvService, orgId, `campaign_${campaignId}`, batchNumber, 'failed', {
+      error: error.message,
+      failedAt: new Date().toISOString()
+    });
+    
+    throw error;
+  }
+}
+
+// Helper functions for campaign sending
+async function sendEmail(contact, campaign, salesMember, emailEndpoint) {
+  if (!emailEndpoint) {
+    throw new Error('Email endpoint not configured');
+  }
+  
+  // Replace template variables
+  let emailContent = campaign.emailTemplate
+    .replace(/\{firstName\}/g, contact.firstName || '')
+    .replace(/\{lastName\}/g, contact.lastName || '')
+    .replace(/\{email\}/g, contact.email || '');
+  
+  // Replace custom metadata variables
+  if (contact.metadata) {
+    Object.entries(contact.metadata).forEach(([key, value]) => {
+      emailContent = emailContent.replace(new RegExp(`\\{${key}\\}`, 'g'), value || '');
+    });
+  }
+  
+  // Replace sales member variables if applicable
+  if (salesMember) {
+    emailContent = emailContent
+      .replace(/\{salesPersonName\}/g, salesMember.firstName + ' ' + salesMember.lastName)
+      .replace(/\{salesPersonEmail\}/g, salesMember.email || '')
+      .replace(/\{salesPersonPhone\}/g, salesMember.phone || '');
+  }
+  
+  const response = await fetch(emailEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      to: contact.email,
+      subject: campaign.emailSubject || 'Message from ' + (salesMember?.firstName || 'Our Team'),
+      content: emailContent,
+      fromName: salesMember?.firstName + ' ' + salesMember?.lastName || 'Our Team'
+    })
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Email API error: ${response.status}`);
+  }
+}
+
+async function sendSMS(contact, campaign, salesMember, smsEndpoint) {
+  if (!smsEndpoint) {
+    throw new Error('SMS endpoint not configured');
+  }
+  
+  // Replace template variables
+  let smsContent = campaign.smsTemplate
+    .replace(/\{firstName\}/g, contact.firstName || '')
+    .replace(/\{lastName\}/g, contact.lastName || '');
+  
+  // Replace custom metadata variables
+  if (contact.metadata) {
+    Object.entries(contact.metadata).forEach(([key, value]) => {
+      smsContent = smsContent.replace(new RegExp(`\\{${key}\\}`, 'g'), value || '');
+    });
+  }
+  
+  // Replace sales member variables if applicable
+  if (salesMember) {
+    smsContent = smsContent
+      .replace(/\{salesPersonName\}/g, salesMember.firstName + ' ' + salesMember.lastName)
+      .replace(/\{salesPersonPhone\}/g, salesMember.phone || '');
+  }
+  
+  const response = await fetch(smsEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      to: contact.phone,
+      message: smsContent,
+      from: salesMember?.phone || '+1234567890' // Default number
+    })
+  });
+  
+  if (!response.ok) {
+    throw new Error(`SMS API error: ${response.status}`);
+  }
+}
+
+async function trackCampaignDelivery(kvService, orgId, campaignId, contactId, deliveryData) {
+  const deliveryKey = `org:${orgId}:delivery:${campaignId}:${contactId}`;
+  await kvService.put(deliveryKey, deliveryData);
+}
+
+async function checkAndFinalizeCampaign(kvService, orgId, campaignId, totalBatches) {
+  try {
+    // Check if all batches are completed
+    const completedBatches = [];
+    for (let i = 1; i <= totalBatches; i++) {
+      const batchKey = `org:${orgId}:campaign_batch:campaign_${campaignId}:${i}`;
+      const batchStatus = await kvService.getCache(batchKey);
+      if (batchStatus?.status === 'completed') {
+        completedBatches.push(batchStatus);
+      }
+    }
+    
+    if (completedBatches.length === totalBatches) {
+      console.log('🎉 ALL CAMPAIGN BATCHES COMPLETED - Finalizing campaign');
+      
+      // Aggregate results
+      const totalResults = completedBatches.reduce((acc, batch) => ({
+        sent: acc.sent + (batch.sent || 0),
+        failed: acc.failed + (batch.failed || 0),
+        errors: acc.errors + (batch.errors || 0)
+      }), { sent: 0, failed: 0, errors: 0 });
+      
+      // Update campaign status
+      const campaignKey = `org:${orgId}:campaign:${campaignId}`;
+      const campaign = await kvService.get(campaignKey);
+      if (campaign) {
+        campaign.status = 'completed';
+        campaign.completedAt = new Date().toISOString();
+        campaign.results = totalResults;
+        await kvService.put(campaignKey, campaign);
+      }
+      
+      console.log('✅ CAMPAIGN FINALIZATION COMPLETE:', totalResults);
+    }
+  } catch (error) {
+    console.error('❌ CAMPAIGN FINALIZATION FAILED:', error);
+  }
+}
+
+// Contact deletion processor
+async function processContactDeletion(message, kvService) {
+  const { orgId, batchNumber, totalBatches, contactKeys } = message;
+  
+  console.log(`🗑️ DELETE BATCH ${batchNumber}/${totalBatches} - Deleting ${contactKeys.length} contact keys`);
+  
+  try {
+    let deletedCount = 0;
+    let errorCount = 0;
+    
+    // Delete in small batches to avoid rate limits
+    const DELETE_BATCH_SIZE = 20;
+    
+    for (let i = 0; i < contactKeys.length; i += DELETE_BATCH_SIZE) {
+      const batch = contactKeys.slice(i, i + DELETE_BATCH_SIZE);
+      
+      const deletePromises = batch.map(async (key) => {
+        try {
+          await kvService.main.delete(key);
+          return { success: true };
+        } catch (error) {
+          console.error(`Failed to delete key ${key}:`, error);
+          return { success: false, error };
+        }
+      });
+      
+      const results = await Promise.all(deletePromises);
+      results.forEach(result => {
+        if (result.success) {
+          deletedCount++;
+        } else {
+          errorCount++;
+        }
+      });
+      
+      // Small delay between batches
+      if (i + DELETE_BATCH_SIZE < contactKeys.length) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+    
+    console.log(`✅ DELETE BATCH ${batchNumber}/${totalBatches} - Deleted: ${deletedCount}, Errors: ${errorCount}`);
+    
+    // Mark batch as completed
+    await updateBatchStatus(kvService, orgId, 'deletion', batchNumber, 'completed', {
+      deleted: deletedCount,
+      errors: errorCount,
+      completedAt: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error(`❌ DELETE BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
+    throw error;
   }
 }
 
@@ -494,33 +805,63 @@ export default {
     let errorCount = 0;
     
     // Process messages SEQUENTIALLY to avoid KV operation overlap
-    // This prevents multiple contact batches from hitting KV limit simultaneously
+    // This prevents multiple operations from hitting KV limit simultaneously
     for (const message of messages) {
       try {
-        if (!message.body) {
-          console.error('❌ QUEUE WORKER - Message missing body:', message.id);
+        if (!message.body || !message.body.type) {
+          console.error('❌ QUEUE WORKER - Message missing body or type:', message.id);
           message.retry();
           errorCount++;
           continue;
+        }
+        
+        // Estimate KV operations needed based on message type
+        let estimatedOpsNeeded = 0;
+        switch (message.body.type) {
+          case MESSAGE_TYPES.CONTACT_BATCH:
+            estimatedOpsNeeded = (message.body.contacts?.length || 0) * 5;
+            break;
+          case MESSAGE_TYPES.CAMPAIGN_SEND:
+            estimatedOpsNeeded = (message.body.contacts?.length || 0) * 2; // Less KV operations
+            break;
+          case MESSAGE_TYPES.CONTACT_DELETE:
+            estimatedOpsNeeded = (message.body.contactKeys?.length || 0);
+            break;
+          default:
+            console.warn(`⚠️ QUEUE WORKER - Unknown message type: ${message.body.type}`);
+            estimatedOpsNeeded = 100; // Conservative estimate
         }
         
         // Check if we have enough KV operations left for this message
-        const estimatedOpsNeeded = (message.body.contacts?.length || 0) * 5;
         if (kvService.operationCount + estimatedOpsNeeded > kvService.maxOperations) {
-          console.warn(`⚠️ QUEUE WORKER - KV limit would be exceeded for message ${message.id}, retrying`);
+          console.warn(`⚠️ QUEUE WORKER - KV limit would be exceeded for message ${message.id} (${message.body.type}), retrying`);
           message.retry();
           errorCount++;
           continue;
         }
         
-        console.log(`📫 Processing message ${message.id} (${message.body.contacts?.length || 0} contacts)`);
-        await processContactBatch(message.body, kvService);
+        console.log(`📫 Processing ${message.body.type} message ${message.id}`);
+        
+        // Route to appropriate processor based on message type
+        switch (message.body.type) {
+          case MESSAGE_TYPES.CONTACT_BATCH:
+            await processContactBatch(message.body, kvService);
+            break;
+          case MESSAGE_TYPES.CAMPAIGN_SEND:
+            await processCampaignBatch(message.body, kvService);
+            break;
+          case MESSAGE_TYPES.CONTACT_DELETE:
+            await processContactDeletion(message.body, kvService);
+            break;
+          default:
+            throw new Error(`Unknown message type: ${message.body.type}`);
+        }
         
         // Acknowledge successful processing
         message.ack();
         processedCount++;
         
-        console.log(`✅ Message ${message.id} completed - KV ops: ${kvService.operationCount}/${kvService.maxOperations}`);
+        console.log(`✅ Message ${message.id} (${message.body.type}) completed - KV ops: ${kvService.operationCount}/${kvService.maxOperations}`);
         
       } catch (error) {
         console.error(`❌ QUEUE WORKER - Failed to process message ${message.id}:`, error);
