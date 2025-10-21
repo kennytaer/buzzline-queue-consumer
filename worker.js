@@ -910,50 +910,59 @@ async function processContactBatch(message, kvService) {
       startTime: new Date().toISOString()
     });
 
-    // PHASE 3: Use pre-checked duplicate flags from upload handler
-    // No need to check duplicates here - already done before queueing!
-    console.log(`📊 PHASE 3 - Using pre-checked duplicate flags from upload handler`);
+    // PHASE 3 REVISED: Lightweight duplicate checking using direct KV lookups
+    // No search index needed - just check email/phone indexes directly
+    console.log(`📊 PHASE 3 - Checking duplicates using direct KV lookups`);
 
     const newContacts = [];
     const duplicateUpdates = [];
 
-    for (const {rowIndex, contact, contactId, isDuplicate, existingContactId} of contacts) {
-      if (isDuplicate && existingContactId) {
-        // PHASE 3: Fetch the existing contact to get current data
-        const existingContact = await contactService.kv.get(`org:${orgId}:contact:${existingContactId}`);
+    // Check duplicates one at a time using direct KV index lookups (simple and fast)
+    for (const {rowIndex, contact, contactId} of contacts) {
+      let existingContact = null;
 
-        if (existingContact) {
-          // Handle duplicate - existing contact found
-          const updatedListIds = existingContact.contactListIds || [];
-          if (!updatedListIds.includes(listId)) {
-            updatedListIds.push(listId);
-          }
-
-          const mergedMetadata = { ...existingContact.metadata, ...contact.metadata };
-
-          const updates = {
-            firstName: contact.firstName || existingContact.firstName,
-            lastName: contact.lastName || existingContact.lastName,
-            email: contact.email || existingContact.email,
-            phone: contact.phone || existingContact.phone,
-            metadata: mergedMetadata,
-            contactListIds: updatedListIds
-          };
-
-          if (reactivateDuplicates && existingContact.optedOut) {
-            updates.optedOut = false;
-            updates.optedOutAt = null;
-          }
-
-          duplicateUpdates.push({contact: {...existingContact, id: existingContactId}, updates});
-        } else {
-          // Existing contact not found - treat as new (rare edge case)
-          console.warn(`⚠️ Existing contact ${existingContactId} not found, treating as new contact`);
-          newContacts.push({
-            id: contactId,
-            data: contact
-          });
+      // Check email index first (1 KV read if email exists)
+      if (contact.email) {
+        const emailKey = `org:${orgId}:contact_by_email:${contact.email.toLowerCase()}`;
+        const emailContact = await contactService.kv.get(emailKey);
+        if (emailContact) {
+          existingContact = emailContact;
         }
+      }
+
+      // Check phone index if no email match (1 KV read if phone exists and email didn't match)
+      if (!existingContact && contact.phone) {
+        const phoneKey = `org:${orgId}:contact_by_phone:${contact.phone}`;
+        const phoneContact = await contactService.kv.get(phoneKey);
+        if (phoneContact) {
+          existingContact = phoneContact;
+        }
+      }
+
+      if (existingContact) {
+        // Handle duplicate
+        const updatedListIds = existingContact.contactListIds || [];
+        if (!updatedListIds.includes(listId)) {
+          updatedListIds.push(listId);
+        }
+
+        const mergedMetadata = { ...existingContact.metadata, ...contact.metadata };
+
+        const updates = {
+          firstName: contact.firstName || existingContact.firstName,
+          lastName: contact.lastName || existingContact.lastName,
+          email: contact.email || existingContact.email,
+          phone: contact.phone || existingContact.phone,
+          metadata: mergedMetadata,
+          contactListIds: updatedListIds
+        };
+
+        if (reactivateDuplicates && existingContact.optedOut) {
+          updates.optedOut = false;
+          updates.optedOutAt = null;
+        }
+
+        duplicateUpdates.push({contact: existingContact, updates});
       } else {
         // New contact
         newContacts.push({
