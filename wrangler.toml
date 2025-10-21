@@ -16,6 +16,11 @@ id = "45f26618ca3042ee8c90df3ac3b5ff2b"
 binding = "BUZZLINE_CACHE"
 id = "951b33a733c446378409d0825256c060"
 
+# Queue producer - allows worker to queue continuation messages
+[[queues.producers]]
+queue = "contact-processing-queue"
+binding = "CONTACT_PROCESSING_QUEUE"
+
 # Queue consumer - Optimized async processing with KV protection
 [[queues.consumers]]
 queue = "contact-processing-queue"
