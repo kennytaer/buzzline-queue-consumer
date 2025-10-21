@@ -910,18 +910,14 @@ async function processContactBatch(message, kvService) {
       startTime: new Date().toISOString()
     });
 
-    // PHASE 3 REVISED: Lightweight duplicate checking using direct KV lookups
-    // No search index needed - just check email/phone indexes directly
-    console.log(`📊 PHASE 3 - Checking duplicates using direct KV lookups`);
+    // PHASE 3 REVISED: Parallel duplicate checking using direct KV lookups
+    console.log(`📊 PHASE 3 - Checking duplicates using parallel KV lookups`);
 
-    const newContacts = [];
-    const duplicateUpdates = [];
-
-    // Check duplicates one at a time using direct KV index lookups (simple and fast)
-    for (const {rowIndex, contact, contactId} of contacts) {
+    // Build all KV lookup promises in parallel
+    const duplicateCheckPromises = contacts.map(async ({rowIndex, contact, contactId}) => {
       let existingContact = null;
 
-      // Check email index first (1 KV read if email exists)
+      // Check email index (parallel)
       if (contact.email) {
         const emailKey = `org:${orgId}:contact_by_email:${contact.email.toLowerCase()}`;
         const emailContact = await contactService.kv.get(emailKey);
@@ -930,7 +926,7 @@ async function processContactBatch(message, kvService) {
         }
       }
 
-      // Check phone index if no email match (1 KV read if phone exists and email didn't match)
+      // Check phone index if no email match (only if needed)
       if (!existingContact && contact.phone) {
         const phoneKey = `org:${orgId}:contact_by_phone:${contact.phone}`;
         const phoneContact = await contactService.kv.get(phoneKey);
@@ -939,6 +935,22 @@ async function processContactBatch(message, kvService) {
         }
       }
 
+      return {
+        rowIndex,
+        contact,
+        contactId,
+        existingContact
+      };
+    });
+
+    // Execute all duplicate checks in parallel
+    const duplicateCheckResults = await Promise.all(duplicateCheckPromises);
+
+    // Separate new contacts from duplicates based on results
+    const newContacts = [];
+    const duplicateUpdates = [];
+
+    for (const {rowIndex, contact, contactId, existingContact} of duplicateCheckResults) {
       if (existingContact) {
         // Handle duplicate
         const updatedListIds = existingContact.contactListIds || [];
@@ -1073,12 +1085,21 @@ async function processContactBatch(message, kvService) {
     
   } catch (error) {
     console.error(`❌ WORKER BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
-    
+    console.error(`❌ WORKER BATCH ${batchNumber}/${totalBatches} - Error stack:`, error instanceof Error ? error.stack : 'No stack trace');
+    console.error(`❌ WORKER BATCH ${batchNumber}/${totalBatches} - Error details:`, {
+      message: error instanceof Error ? error.message : String(error),
+      name: error instanceof Error ? error.name : 'Unknown',
+      uploadId,
+      orgId,
+      contactsInBatch: contacts.length
+    });
+
     await updateBatchStatus(kvService, orgId, uploadId, batchNumber, 'failed', {
       error: error instanceof Error ? error.message : 'Unknown error',
+      errorStack: error instanceof Error ? error.stack : undefined,
       failedAt: new Date().toISOString()
     });
-    
+
     throw error; // Let queue retry
   }
 }
