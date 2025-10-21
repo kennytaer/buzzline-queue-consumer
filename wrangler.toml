@@ -16,10 +16,10 @@ id = "45f26618ca3042ee8c90df3ac3b5ff2b"
 binding = "BUZZLINE_CACHE"
 id = "951b33a733c446378409d0825256c060"
 
-# Queue consumer - Balanced async processing with KV protection
+# Queue consumer - Optimized async processing with KV protection
 [[queues.consumers]]
 queue = "contact-processing-queue"
-max_batch_size = 2                # Very small: 2 messages max per worker (2 × 250 = 500 ops)
-max_batch_timeout = 2             # Quick processing
-max_retries = 2                   # Allow retries but not excessive
+max_batch_size = 3                # PHASE 1: Increased from 2 to 3 (3 × 50 × 5 = 750 ops, safe within 950 limit)
+max_batch_timeout = 5             # PHASE 1: Increased timeout for parallel processing
+max_retries = 5                   # PHASE 1: Better resilience with more retries
 max_concurrency = 10              # Good parallelism for async processing

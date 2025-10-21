@@ -321,78 +321,114 @@ class ContactService {
   async createContactsBulk(orgId, contacts) {
     const created = [];
     const errors = [];
-    
-    // Process contacts in parallel batches for better performance
-    const PARALLEL_BATCH_SIZE = 10;
-    
-    for (let i = 0; i < contacts.length; i += PARALLEL_BATCH_SIZE) {
-      const batch = contacts.slice(i, i + PARALLEL_BATCH_SIZE);
-      const batchPromises = batch.map(async ({ id, data }) => {
+
+    // PHASE 2 OPTIMIZATION: Collect ALL KV operations first, then execute in optimized chunks
+    const allKvOperations = [];
+    const contactMap = new Map(); // Track which operations belong to which contact
+
+    // Build all KV operations upfront
+    contacts.forEach(({ id, data }) => {
+      const contact = {
+        id,
+        orgId,
+        ...data,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+
+      contactMap.set(id, contact);
+
+      // Main contact record
+      const contactKey = `org:${orgId}:contact:${id}`;
+      allKvOperations.push({ type: 'put', key: contactKey, value: contact, contactId: id });
+
+      // Email index
+      if (contact.email) {
+        const emailKey = `org:${orgId}:contact_by_email:${contact.email.toLowerCase()}`;
+        allKvOperations.push({ type: 'put', key: emailKey, value: contact, contactId: id });
+      }
+
+      // Phone index
+      if (contact.phone) {
+        const phoneKey = `org:${orgId}:contact_by_phone:${contact.phone}`;
+        allKvOperations.push({ type: 'put', key: phoneKey, value: contact, contactId: id });
+      }
+    });
+
+    console.log(`📦 Executing ${allKvOperations.length} KV operations for ${contacts.length} contacts`);
+
+    // OPTIMIZED: Execute all KV operations in larger parallel chunks (50 at a time)
+    const KV_WRITE_CHUNK_SIZE = 50;
+    const opResults = new Map(); // Track success/failure per contact
+
+    for (let i = 0; i < allKvOperations.length; i += KV_WRITE_CHUNK_SIZE) {
+      const chunk = allKvOperations.slice(i, i + KV_WRITE_CHUNK_SIZE);
+
+      const chunkPromises = chunk.map(async (op) => {
         try {
-          const contact = {
-            id,
-            orgId,
-            ...data,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString()
-          };
-
-          // Prepare all KV operations for this contact
-          const kvOperations = [];
-          
-          // Store main contact record
-          const contactKey = `org:${orgId}:contact:${id}`;
-          kvOperations.push(this.kv.put(contactKey, contact));
-
-          // Store email index if exists
-          if (contact.email) {
-            const emailKey = `org:${orgId}:contact_by_email:${contact.email.toLowerCase()}`;
-            kvOperations.push(this.kv.put(emailKey, contact));
-          }
-
-          // Store phone index if exists
-          if (contact.phone) {
-            const phoneKey = `org:${orgId}:contact_by_phone:${contact.phone}`;
-            kvOperations.push(this.kv.put(phoneKey, contact));
-          }
-          
-          // Execute all KV operations for this contact in parallel
-          await Promise.allSettled(kvOperations);
-          
-          return { success: true, contact };
+          await this.kv.put(op.key, op.value);
+          return { success: true, contactId: op.contactId };
         } catch (error) {
-          console.error(`Failed to create contact ${id}:`, error);
-          return { success: false, id, error: error.message };
+          console.error(`Failed KV operation for contact ${op.contactId}:`, error);
+          return { success: false, contactId: op.contactId, error: error.message };
         }
       });
-      
-      // Wait for this batch to complete
-      const batchResults = await Promise.allSettled(batchPromises);
-      
-      // Process results
-      batchResults.forEach(result => {
-        if (result.status === 'fulfilled') {
-          if (result.value.success) {
-            created.push(result.value.contact);
-          } else {
-            errors.push({ id: result.value.id, error: result.value.error });
+
+      const chunkResults = await Promise.allSettled(chunkPromises);
+
+      // Track results per contact
+      chunkResults.forEach(result => {
+        if (result.status === 'fulfilled' && result.value) {
+          const { contactId, success, error } = result.value;
+          if (!opResults.has(contactId)) {
+            opResults.set(contactId, { successes: 0, failures: 0, errors: [] });
           }
-        } else {
-          errors.push({ id: 'unknown', error: result.reason?.message || 'Unknown error' });
+          if (success) {
+            opResults.get(contactId).successes++;
+          } else {
+            opResults.get(contactId).failures++;
+            opResults.get(contactId).errors.push(error);
+          }
         }
       });
     }
 
+    // Process final results per contact
+    contacts.forEach(({ id }) => {
+      const result = opResults.get(id);
+      const contact = contactMap.get(id);
+
+      if (result && result.failures === 0) {
+        // All operations succeeded for this contact
+        created.push(contact);
+      } else {
+        // At least one operation failed
+        errors.push({
+          id,
+          error: result?.errors?.join(', ') || 'Failed to create contact'
+        });
+      }
+    });
+
     return { created, errors };
   }
 
-  async updateContact(orgId, contactId, updates) {
+  async updateContact(orgId, contactId, updates, retries = 2) {
     try {
       const contactKey = `org:${orgId}:contact:${contactId}`;
-      const existing = await this.kv.get(contactKey);
-      
+      let existing = await this.kv.get(contactKey);
+
+      // RACE CONDITION FIX: Retry if contact not found (might be mid-write from parallel batch)
+      if (!existing && retries > 0) {
+        console.log(`⚠️ Contact ${contactId} not found, retrying (${retries} attempts left)...`);
+        await new Promise(resolve => setTimeout(resolve, 100)); // Wait 100ms
+        return this.updateContact(orgId, contactId, updates, retries - 1);
+      }
+
       if (!existing) {
-        throw new Error('Contact not found');
+        // After retries, if still not found, treat as warning not error
+        console.warn(`⚠️ Contact ${contactId} not found after retries - may have been created by another batch`);
+        return null;
       }
 
       const updated = {
@@ -414,7 +450,7 @@ class ContactService {
         const phoneKey = `org:${orgId}:contact_by_phone:${updates.phone}`;
         kvOperations.push(this.kv.put(phoneKey, updated));
       }
-      
+
       // Execute all updates in parallel
       await Promise.allSettled(kvOperations);
 
@@ -954,7 +990,12 @@ async function processContactBatch(message, kvService) {
       
       const updatePromises = batch.map(async ({contact, updates}) => {
         try {
-          await contactService.updateContact(orgId, contact.id, updates);
+          const result = await contactService.updateContact(orgId, contact.id, updates);
+          // If result is null, contact wasn't found after retries (race condition)
+          if (result === null) {
+            console.warn(`⚠️ Skipping update for contact ${contact.id} - not found after retries`);
+            return { success: true, skipped: true };
+          }
           return {
             success: true,
             reactivated: reactivateDuplicates && contact.optedOut
@@ -973,7 +1014,10 @@ async function processContactBatch(message, kvService) {
       batchResults.forEach(result => {
         if (result.status === 'fulfilled') {
           if (result.value.success) {
-            if (result.value.reactivated) {
+            if (result.value.skipped) {
+              // Contact wasn't found (race condition) - don't count as error
+              skippedDuplicates++;
+            } else if (result.value.reactivated) {
               duplicatesUpdated++;
             } else {
               skippedDuplicates++;
@@ -987,15 +1031,20 @@ async function processContactBatch(message, kvService) {
       });
     }
     
-    // Update batch completion status
-    await updateBatchStatus(kvService, orgId, uploadId, batchNumber, 'completed', {
-      contacts: contacts.length,
-      created: results.created.length,
-      duplicatesUpdated,
-      skippedDuplicates,
-      errors: results.errors.length,
-      completedAt: new Date().toISOString()
-    });
+    // PHASE 2 OPTIMIZATION: Only update status every 5th batch or on final batch
+    if (batchNumber % 5 === 0 || batchNumber === totalBatches) {
+      await updateBatchStatus(kvService, orgId, uploadId, batchNumber, 'completed', {
+        contacts: contacts.length,
+        created: results.created.length,
+        duplicatesUpdated,
+        skippedDuplicates,
+        errors: results.errors.length,
+        completedAt: new Date().toISOString()
+      });
+    } else {
+      // For non-milestone batches, just log locally (don't write to KV)
+      console.log(`📊 BATCH ${batchNumber}/${totalBatches} completed (status update skipped - milestone batches only)`);
+    }
     
     console.log(`✅ WORKER BATCH ${batchNumber}/${totalBatches} - Completed:`, {
       created: results.created.length,
@@ -1098,11 +1147,15 @@ async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId,
 
 export default {
   async queue(batch, env, ctx) {
-    const startTime = Date.now();
+    const batchStartTime = Date.now();
+    const queueTimestamp = batch.messages?.[0]?.timestamp || Date.now();
+    const queueLatency = batchStartTime - queueTimestamp;
+
     console.log('🚀 QUEUE WORKER - Processing MessageBatch:', {
       batchKeys: Object.keys(batch),
       queueName: batch.queue,
-      messageCount: batch.messages?.length || 0
+      messageCount: batch.messages?.length || 0,
+      queueLatencyMs: queueLatency
     });
 
     const kvService = new KVService(env);
@@ -1110,90 +1163,254 @@ export default {
 
     // Access messages from batch.messages (Cloudflare Queue format)
     const messages = batch.messages || [];
-    
+
+    // PHASE 1 OPTIMIZATION: Calculate total KV operations needed for entire batch upfront
+    let totalEstimatedOps = 0;
+    const messageMetrics = messages.map(message => {
+      if (!message.body || !message.body.type) {
+        return { message, estimatedOps: 0, valid: false };
+      }
+
+      let estimatedOps = 0;
+      switch (message.body.type) {
+        case MESSAGE_TYPES.CONTACT_BATCH:
+          estimatedOps = (message.body.contacts?.length || 0) * 5;
+          break;
+        case MESSAGE_TYPES.CAMPAIGN_SEND:
+          estimatedOps = (message.body.contacts?.length || 0) * 2;
+          break;
+        case MESSAGE_TYPES.CONTACT_DELETE:
+          estimatedOps = (message.body.contactKeys?.length || 0);
+          break;
+        case MESSAGE_TYPES.OPT_OUT_BATCH:
+          estimatedOps = (message.body.optOuts?.length || 0) * 3;
+          break;
+        default:
+          estimatedOps = 100;
+      }
+
+      totalEstimatedOps += estimatedOps;
+      return {
+        message,
+        estimatedOps,
+        valid: true,
+        attempts: message.attempts || 0
+      };
+    });
+
+    console.log(`📊 BATCH PRE-FLIGHT CHECK:`, {
+      totalMessages: messages.length,
+      totalEstimatedOps,
+      kvLimit: kvService.maxOperations,
+      withinLimit: totalEstimatedOps <= kvService.maxOperations
+    });
+
+    // PARALLEL PROCESSING: Process all messages in parallel if within KV limit
+    const canProcessInParallel = totalEstimatedOps <= kvService.maxOperations;
+
     let processedCount = 0;
     let errorCount = 0;
-    
-    // Process messages SEQUENTIALLY to avoid KV operation overlap
-    // This prevents multiple operations from hitting KV limit simultaneously
-    for (const message of messages) {
-      try {
-        if (!message.body || !message.body.type) {
-          console.error('❌ QUEUE WORKER - Message missing body or type:', message.id);
+    const messageTimings = [];
+
+    if (canProcessInParallel) {
+      console.log('⚡ PARALLEL MODE: Processing all messages concurrently');
+
+      // Process all messages in parallel
+      const results = await Promise.allSettled(
+        messageMetrics.map(async ({ message, estimatedOps, valid, attempts }) => {
+          const msgStartTime = Date.now();
+
+          try {
+            if (!valid) {
+              console.error('❌ QUEUE WORKER - Message missing body or type:', message.id);
+              message.retry();
+              return { success: false, id: message.id, error: 'Invalid message', timing: 0 };
+            }
+
+            console.log(`📫 Processing ${message.body.type} message ${message.id} (attempt ${attempts + 1}, ~${estimatedOps} ops)`);
+
+            // Route to appropriate processor
+            switch (message.body.type) {
+              case MESSAGE_TYPES.CONTACT_BATCH:
+                await processContactBatch(message.body, kvService);
+                break;
+              case MESSAGE_TYPES.CAMPAIGN_SEND:
+                await processCampaignBatch(message.body, kvService);
+                break;
+              case MESSAGE_TYPES.CONTACT_DELETE:
+                await processContactDeletion(message.body, kvService);
+                break;
+              case MESSAGE_TYPES.OPT_OUT_BATCH:
+                await processOptOutBatch(message.body, kvService);
+                break;
+              default:
+                throw new Error(`Unknown message type: ${message.body.type}`);
+            }
+
+            const msgTiming = Date.now() - msgStartTime;
+            message.ack();
+
+            console.log(`✅ Message ${message.id} (${message.body.type}) completed in ${msgTiming}ms`);
+
+            return {
+              success: true,
+              id: message.id,
+              type: message.body.type,
+              timing: msgTiming,
+              attempts,
+              estimatedOps
+            };
+
+          } catch (error) {
+            const msgTiming = Date.now() - msgStartTime;
+            console.error(`❌ QUEUE WORKER - Failed to process message ${message.id}:`, error);
+            message.retry();
+
+            return {
+              success: false,
+              id: message.id,
+              error: error.message,
+              timing: msgTiming,
+              attempts
+            };
+          }
+        })
+      );
+
+      // Process results
+      results.forEach(result => {
+        if (result.status === 'fulfilled') {
+          if (result.value.success) {
+            processedCount++;
+            messageTimings.push(result.value);
+          } else {
+            errorCount++;
+          }
+        } else {
+          errorCount++;
+        }
+      });
+
+    } else {
+      // SEQUENTIAL FALLBACK: Process messages one at a time until KV limit
+      console.log('⚠️ SEQUENTIAL MODE: Batch exceeds KV limit, processing sequentially');
+
+      for (const { message, estimatedOps, valid, attempts } of messageMetrics) {
+        const msgStartTime = Date.now();
+
+        try {
+          if (!valid) {
+            console.error('❌ QUEUE WORKER - Message missing body or type:', message.id);
+            message.retry();
+            errorCount++;
+            continue;
+          }
+
+          // Check if we have enough KV operations left
+          if (kvService.operationCount + estimatedOps > kvService.maxOperations) {
+            console.warn(`⚠️ QUEUE WORKER - KV limit reached, retrying message ${message.id}`);
+            message.retry();
+            errorCount++;
+            continue;
+          }
+
+          console.log(`📫 Processing ${message.body.type} message ${message.id} (attempt ${attempts + 1})`);
+
+          // Route to appropriate processor
+          switch (message.body.type) {
+            case MESSAGE_TYPES.CONTACT_BATCH:
+              await processContactBatch(message.body, kvService);
+              break;
+            case MESSAGE_TYPES.CAMPAIGN_SEND:
+              await processCampaignBatch(message.body, kvService);
+              break;
+            case MESSAGE_TYPES.CONTACT_DELETE:
+              await processContactDeletion(message.body, kvService);
+              break;
+            case MESSAGE_TYPES.OPT_OUT_BATCH:
+              await processOptOutBatch(message.body, kvService);
+              break;
+            default:
+              throw new Error(`Unknown message type: ${message.body.type}`);
+          }
+
+          const msgTiming = Date.now() - msgStartTime;
+          message.ack();
+          processedCount++;
+
+          messageTimings.push({
+            success: true,
+            id: message.id,
+            type: message.body.type,
+            timing: msgTiming,
+            attempts,
+            estimatedOps
+          });
+
+          console.log(`✅ Message ${message.id} completed in ${msgTiming}ms - KV ops: ${kvService.operationCount}/${kvService.maxOperations}`);
+
+        } catch (error) {
+          const msgTiming = Date.now() - msgStartTime;
+          console.error(`❌ QUEUE WORKER - Failed to process message ${message.id}:`, error);
           message.retry();
           errorCount++;
-          continue;
         }
-        
-        // Estimate KV operations needed based on message type
-        let estimatedOpsNeeded = 0;
-        switch (message.body.type) {
-          case MESSAGE_TYPES.CONTACT_BATCH:
-            estimatedOpsNeeded = (message.body.contacts?.length || 0) * 5;
-            break;
-          case MESSAGE_TYPES.CAMPAIGN_SEND:
-            estimatedOpsNeeded = (message.body.contacts?.length || 0) * 2; // Less KV operations
-            break;
-          case MESSAGE_TYPES.CONTACT_DELETE:
-            estimatedOpsNeeded = (message.body.contactKeys?.length || 0);
-            break;
-          default:
-            console.warn(`⚠️ QUEUE WORKER - Unknown message type: ${message.body.type}`);
-            estimatedOpsNeeded = 100; // Conservative estimate
-        }
-        
-        // Check if we have enough KV operations left for this message
-        if (kvService.operationCount + estimatedOpsNeeded > kvService.maxOperations) {
-          console.warn(`⚠️ QUEUE WORKER - KV limit would be exceeded for message ${message.id} (${message.body.type}), retrying`);
-          message.retry();
-          errorCount++;
-          continue;
-        }
-        
-        console.log(`📫 Processing ${message.body.type} message ${message.id}`);
-        
-        // Route to appropriate processor based on message type
-        switch (message.body.type) {
-          case MESSAGE_TYPES.CONTACT_BATCH:
-            await processContactBatch(message.body, kvService);
-            break;
-          case MESSAGE_TYPES.CAMPAIGN_SEND:
-            await processCampaignBatch(message.body, kvService);
-            break;
-          case MESSAGE_TYPES.CONTACT_DELETE:
-            await processContactDeletion(message.body, kvService);
-            break;
-          case MESSAGE_TYPES.OPT_OUT_BATCH:
-            await processOptOutBatch(message.body, kvService);
-            break;
-          default:
-            throw new Error(`Unknown message type: ${message.body.type}`);
-        }
-        
-        // Acknowledge successful processing
-        message.ack();
-        processedCount++;
-        
-        console.log(`✅ Message ${message.id} (${message.body.type}) completed - KV ops: ${kvService.operationCount}/${kvService.maxOperations}`);
-        
-      } catch (error) {
-        console.error(`❌ QUEUE WORKER - Failed to process message ${message.id}:`, error);
-        // Individual message retry - won't affect other messages
-        message.retry();
-        errorCount++;
       }
     }
-    
-    const processingTime = Date.now() - startTime;
+
+    const batchTotalTime = Date.now() - batchStartTime;
+    const avgMessageTime = messageTimings.length > 0
+      ? messageTimings.reduce((sum, m) => sum + m.timing, 0) / messageTimings.length
+      : 0;
+
+    // TELEMETRY: Store metrics in analytics KV
+    const telemetryData = {
+      timestamp: new Date().toISOString(),
+      batchId: batch.queue + '_' + batchStartTime,
+      queueName: batch.queue,
+      processingMode: canProcessInParallel ? 'parallel' : 'sequential',
+      metrics: {
+        totalMessages: messages.length,
+        processedMessages: processedCount,
+        errorMessages: errorCount,
+        queueLatencyMs: queueLatency,
+        batchProcessingTimeMs: batchTotalTime,
+        avgMessageTimeMs: Math.round(avgMessageTime),
+        kvOperationsUsed: kvService.operationCount,
+        kvOperationsLimit: kvService.maxOperations,
+        kvUtilization: Math.round((kvService.operationCount / kvService.maxOperations) * 100) + '%'
+      },
+      messageBreakdown: messageTimings.map(m => ({
+        type: m.type,
+        timingMs: m.timing,
+        attempts: m.attempts,
+        estimatedOps: m.estimatedOps
+      }))
+    };
+
+    // Store telemetry
+    try {
+      const telemetryKey = `metrics:queue:batch:${Date.now()}`;
+      await kvService.analytics.put(telemetryKey, JSON.stringify(telemetryData), {
+        expirationTtl: 604800 // 7 days
+      });
+    } catch (error) {
+      console.error('Failed to store telemetry:', error);
+    }
+
     console.log(`✅ QUEUE WORKER - Batch completed:`, {
+      mode: canProcessInParallel ? 'PARALLEL' : 'SEQUENTIAL',
       totalMessages: messages.length,
       processed: processedCount,
       errors: errorCount,
-      processingTime: `${processingTime}ms`,
-      kvOperationsUsed: kvService.operationCount,
-      kvOperationsRemaining: kvService.maxOperations - kvService.operationCount
+      queueLatencyMs: queueLatency,
+      batchTimeMs: batchTotalTime,
+      avgMsgTimeMs: Math.round(avgMessageTime),
+      kvOpsUsed: kvService.operationCount,
+      kvOpsRemaining: kvService.maxOperations - kvService.operationCount,
+      kvUtilization: Math.round((kvService.operationCount / kvService.maxOperations) * 100) + '%'
     });
-    
+
     // Don't throw errors - we handled everything individually
   }
 };
