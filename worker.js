@@ -909,54 +909,51 @@ async function processContactBatch(message, kvService) {
       contacts: contacts.length,
       startTime: new Date().toISOString()
     });
-    
-    // Check for duplicates in this batch
-    const emailsAndPhones = contacts.map(({contact}) => ({
-      email: contact.email || undefined,
-      phone: contact.phone || undefined
-    }));
-    
-    const existingContacts = await contactService.findContactsByEmailsOrPhones(orgId, emailsAndPhones);
-    const existingContactMap = new Map();
-    existingContacts.forEach((item) => {
-      const { email, phone, contact } = item;
-      if (email) existingContactMap.set(email.toLowerCase(), contact);
-      if (phone) existingContactMap.set(phone, contact);
-    });
-    
-    // Separate new contacts from duplicates
+
+    // PHASE 3: Use pre-checked duplicate flags from upload handler
+    // No need to check duplicates here - already done before queueing!
+    console.log(`📊 PHASE 3 - Using pre-checked duplicate flags from upload handler`);
+
     const newContacts = [];
     const duplicateUpdates = [];
-    
-    for (const {rowIndex, contact, contactId} of contacts) {
-      const existingByEmail = contact.email ? existingContactMap.get(contact.email.toLowerCase()) : null;
-      const existingByPhone = contact.phone ? existingContactMap.get(contact.phone) : null;
-      const existingContact = existingByEmail || existingByPhone;
-      
-      if (existingContact) {
-        // Handle duplicate
-        const updatedListIds = existingContact.contactListIds || [];
-        if (!updatedListIds.includes(listId)) {
-          updatedListIds.push(listId);
+
+    for (const {rowIndex, contact, contactId, isDuplicate, existingContactId} of contacts) {
+      if (isDuplicate && existingContactId) {
+        // PHASE 3: Fetch the existing contact to get current data
+        const existingContact = await contactService.kv.get(`org:${orgId}:contact:${existingContactId}`);
+
+        if (existingContact) {
+          // Handle duplicate - existing contact found
+          const updatedListIds = existingContact.contactListIds || [];
+          if (!updatedListIds.includes(listId)) {
+            updatedListIds.push(listId);
+          }
+
+          const mergedMetadata = { ...existingContact.metadata, ...contact.metadata };
+
+          const updates = {
+            firstName: contact.firstName || existingContact.firstName,
+            lastName: contact.lastName || existingContact.lastName,
+            email: contact.email || existingContact.email,
+            phone: contact.phone || existingContact.phone,
+            metadata: mergedMetadata,
+            contactListIds: updatedListIds
+          };
+
+          if (reactivateDuplicates && existingContact.optedOut) {
+            updates.optedOut = false;
+            updates.optedOutAt = null;
+          }
+
+          duplicateUpdates.push({contact: {...existingContact, id: existingContactId}, updates});
+        } else {
+          // Existing contact not found - treat as new (rare edge case)
+          console.warn(`⚠️ Existing contact ${existingContactId} not found, treating as new contact`);
+          newContacts.push({
+            id: contactId,
+            data: contact
+          });
         }
-        
-        const mergedMetadata = { ...existingContact.metadata, ...contact.metadata };
-        
-        const updates = {
-          firstName: contact.firstName || existingContact.firstName,
-          lastName: contact.lastName || existingContact.lastName,
-          email: contact.email || existingContact.email,
-          phone: contact.phone || existingContact.phone,
-          metadata: mergedMetadata,
-          contactListIds: updatedListIds
-        };
-        
-        if (reactivateDuplicates && existingContact.optedOut) {
-          updates.optedOut = false;
-          updates.optedOutAt = null;
-        }
-        
-        duplicateUpdates.push({contact: existingContact, updates});
       } else {
         // New contact
         newContacts.push({
