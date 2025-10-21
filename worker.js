@@ -1049,20 +1049,15 @@ async function processContactBatch(message, kvService) {
       });
     }
     
-    // PHASE 2 OPTIMIZATION: Only update status every 5th batch or on final batch
-    if (batchNumber % 5 === 0 || batchNumber === totalBatches) {
-      await updateBatchStatus(kvService, orgId, uploadId, batchNumber, 'completed', {
-        contacts: contacts.length,
-        created: results.created.length,
-        duplicatesUpdated,
-        skippedDuplicates,
-        errors: results.errors.length,
-        completedAt: new Date().toISOString()
-      });
-    } else {
-      // For non-milestone batches, just log locally (don't write to KV)
-      console.log(`📊 BATCH ${batchNumber}/${totalBatches} completed (status update skipped - milestone batches only)`);
-    }
+    // ALWAYS write completion status so finalization can track progress accurately
+    await updateBatchStatus(kvService, orgId, uploadId, batchNumber, 'completed', {
+      contacts: contacts.length,
+      created: results.created.length,
+      duplicatesUpdated,
+      skippedDuplicates,
+      errors: results.errors.length,
+      completedAt: new Date().toISOString()
+    });
     
     console.log(`✅ WORKER BATCH ${batchNumber}/${totalBatches} - Completed:`, {
       created: results.created.length,
