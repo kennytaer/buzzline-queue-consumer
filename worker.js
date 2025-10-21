@@ -462,8 +462,126 @@ class ContactService {
   }
 
   async forceRebuildMetadata(orgId) {
-    console.log(`Rebuilding metadata for org ${orgId} - simplified version`);
-    // For now, just log. In full version, this would rebuild search indexes
+    console.log(`🔄 WORKER - Rebuilding contact indexes for org ${orgId}`);
+
+    const CONTACTS_PER_PAGE = 50;
+
+    try {
+      // List all contacts for this org from MAIN namespace
+      const prefix = `org:${orgId}:contact:`;
+      const allContacts = [];
+      let cursor = undefined;
+
+      do {
+        const list = await this.kv.main.list({ prefix, limit: 1000, cursor });
+
+        console.log(`📋 WORKER - Found ${list.keys.length} contact keys`);
+
+        // Fetch contacts in batches
+        const FETCH_BATCH_SIZE = 50;
+        for (let i = 0; i < list.keys.length; i += FETCH_BATCH_SIZE) {
+          const keyBatch = list.keys.slice(i, i + FETCH_BATCH_SIZE);
+
+          const batchResults = await Promise.all(
+            keyBatch.map(async (key) => {
+              try {
+                const data = await this.kv.main.get(key.name);
+                return data ? JSON.parse(data) : null;
+              } catch (error) {
+                console.error(`Failed to parse contact from key ${key.name}:`, error);
+                return null;
+              }
+            })
+          );
+
+          allContacts.push(...batchResults.filter(Boolean));
+        }
+
+        cursor = list.list_complete ? undefined : list.cursor;
+      } while (cursor);
+
+      console.log(`📊 WORKER - Retrieved ${allContacts.length} total contacts`);
+
+      // Sort by creation date (newest first)
+      allContacts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+      const totalContacts = allContacts.length;
+      const totalPages = Math.ceil(totalContacts / CONTACTS_PER_PAGE);
+
+      console.log(`📄 WORKER - Building ${totalPages} page indexes`);
+
+      // Clear existing page caches first
+      const metaKey = `org:${orgId}:contact_meta`;
+      const existingMeta = await this.kv.cache.get(metaKey);
+      if (existingMeta) {
+        const metadata = JSON.parse(existingMeta);
+        for (let page = 1; page <= metadata.totalPages + 1; page++) {
+          const pageKey = `org:${orgId}:contact_index:page_${page}`;
+          await this.kv.cache.delete(pageKey);
+        }
+      }
+      await this.kv.cache.delete(metaKey);
+
+      // Rebuild page indexes
+      for (let page = 1; page <= totalPages; page++) {
+        const startIdx = (page - 1) * CONTACTS_PER_PAGE;
+        const endIdx = startIdx + CONTACTS_PER_PAGE;
+        const pageContacts = allContacts.slice(startIdx, endIdx).map(contact => ({
+          id: contact.id,
+          firstName: contact.firstName,
+          lastName: contact.lastName,
+          email: contact.email,
+          phone: contact.phone,
+          createdAt: contact.createdAt,
+          optedOut: contact.optedOut,
+          hasMetadata: contact.metadata && Object.keys(contact.metadata).length > 0
+        }));
+
+        const pageKey = `org:${orgId}:contact_index:page_${page}`;
+        await this.kv.cache.put(pageKey, JSON.stringify(pageContacts));
+      }
+
+      // Build search index
+      console.log('🔍 WORKER - Building search index...');
+      const searchIndex = {};
+      for (const contact of allContacts) {
+        const searchText = [
+          contact.firstName,
+          contact.lastName,
+          contact.email,
+          contact.phone,
+          contact.metadata ? Object.values(contact.metadata).join(' ') : ''
+        ].filter(Boolean).join(' ').toLowerCase();
+
+        searchIndex[contact.id] = {
+          searchText,
+          firstName: contact.firstName,
+          lastName: contact.lastName,
+          email: contact.email,
+          phone: contact.phone,
+          createdAt: contact.createdAt
+        };
+      }
+
+      const searchKey = `org:${orgId}:contact_search`;
+      await this.kv.cache.put(searchKey, JSON.stringify(searchIndex));
+      console.log(`🔍 WORKER - Search index built with ${Object.keys(searchIndex).length} contacts`);
+
+      // Save metadata
+      const metadata = {
+        totalContacts,
+        totalPages,
+        lastUpdated: new Date().toISOString()
+      };
+
+      await this.kv.cache.put(metaKey, JSON.stringify(metadata));
+
+      console.log('✅ WORKER - Contact indexes rebuilt successfully:', metadata);
+      return metadata;
+    } catch (error) {
+      console.error('❌ WORKER - Index rebuild failed:', error);
+      throw error;
+    }
   }
 }
 
