@@ -462,124 +462,37 @@ class ContactService {
   }
 
   async forceRebuildMetadata(orgId) {
-    console.log(`🔄 WORKER - Rebuilding contact indexes for org ${orgId}`);
-
-    const CONTACTS_PER_PAGE = 50;
+    console.log(`🔄 WORKER - Invalidating contact cache for lazy rebuild by dashboard`);
 
     try {
-      // List all contacts for this org from MAIN namespace
-      const prefix = `org:${orgId}:contact:`;
-      const allContacts = [];
-      let cursor = undefined;
+      // STRATEGY: Instead of rebuilding indexes here (which causes KV rate limits),
+      // we just INVALIDATE the cache. The dashboard will rebuild it lazily on first load.
 
-      do {
-        const list = await this.kv.main.list({ prefix, limit: 1000, cursor });
-
-        console.log(`📋 WORKER - Found ${list.keys.length} contact keys`);
-
-        // Fetch contacts in batches
-        const FETCH_BATCH_SIZE = 50;
-        for (let i = 0; i < list.keys.length; i += FETCH_BATCH_SIZE) {
-          const keyBatch = list.keys.slice(i, i + FETCH_BATCH_SIZE);
-
-          const batchResults = await Promise.all(
-            keyBatch.map(async (key) => {
-              try {
-                const data = await this.kv.main.get(key.name);
-                return data ? JSON.parse(data) : null;
-              } catch (error) {
-                console.error(`Failed to parse contact from key ${key.name}:`, error);
-                return null;
-              }
-            })
-          );
-
-          allContacts.push(...batchResults.filter(Boolean));
-        }
-
-        cursor = list.list_complete ? undefined : list.cursor;
-      } while (cursor);
-
-      console.log(`📊 WORKER - Retrieved ${allContacts.length} total contacts`);
-
-      // Sort by creation date (newest first)
-      allContacts.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-      const totalContacts = allContacts.length;
-      const totalPages = Math.ceil(totalContacts / CONTACTS_PER_PAGE);
-
-      console.log(`📄 WORKER - Building ${totalPages} page indexes`);
-
-      // Clear existing page caches first
       const metaKey = `org:${orgId}:contact_meta`;
+      const searchKey = `org:${orgId}:contact_search`;
+
+      // Get existing metadata to know how many pages to clear
       const existingMeta = await this.kv.cache.get(metaKey);
       if (existingMeta) {
         const metadata = JSON.parse(existingMeta);
-        for (let page = 1; page <= metadata.totalPages + 1; page++) {
+        console.log(`🧹 WORKER - Clearing ${metadata.totalPages || 0} cached pages`);
+
+        // Clear all cached page indexes
+        for (let page = 1; page <= (metadata.totalPages || 0) + 1; page++) {
           const pageKey = `org:${orgId}:contact_index:page_${page}`;
           await this.kv.cache.delete(pageKey);
         }
       }
+
+      // Delete metadata and search index
       await this.kv.cache.delete(metaKey);
+      await this.kv.cache.delete(searchKey);
 
-      // Rebuild page indexes
-      for (let page = 1; page <= totalPages; page++) {
-        const startIdx = (page - 1) * CONTACTS_PER_PAGE;
-        const endIdx = startIdx + CONTACTS_PER_PAGE;
-        const pageContacts = allContacts.slice(startIdx, endIdx).map(contact => ({
-          id: contact.id,
-          firstName: contact.firstName,
-          lastName: contact.lastName,
-          email: contact.email,
-          phone: contact.phone,
-          createdAt: contact.createdAt,
-          optedOut: contact.optedOut,
-          hasMetadata: contact.metadata && Object.keys(contact.metadata).length > 0
-        }));
+      console.log('✅ WORKER - Cache invalidated. Dashboard will rebuild on next load.');
 
-        const pageKey = `org:${orgId}:contact_index:page_${page}`;
-        await this.kv.cache.put(pageKey, JSON.stringify(pageContacts));
-      }
-
-      // Build search index
-      console.log('🔍 WORKER - Building search index...');
-      const searchIndex = {};
-      for (const contact of allContacts) {
-        const searchText = [
-          contact.firstName,
-          contact.lastName,
-          contact.email,
-          contact.phone,
-          contact.metadata ? Object.values(contact.metadata).join(' ') : ''
-        ].filter(Boolean).join(' ').toLowerCase();
-
-        searchIndex[contact.id] = {
-          searchText,
-          firstName: contact.firstName,
-          lastName: contact.lastName,
-          email: contact.email,
-          phone: contact.phone,
-          createdAt: contact.createdAt
-        };
-      }
-
-      const searchKey = `org:${orgId}:contact_search`;
-      await this.kv.cache.put(searchKey, JSON.stringify(searchIndex));
-      console.log(`🔍 WORKER - Search index built with ${Object.keys(searchIndex).length} contacts`);
-
-      // Save metadata
-      const metadata = {
-        totalContacts,
-        totalPages,
-        lastUpdated: new Date().toISOString()
-      };
-
-      await this.kv.cache.put(metaKey, JSON.stringify(metadata));
-
-      console.log('✅ WORKER - Contact indexes rebuilt successfully:', metadata);
-      return metadata;
+      return { invalidated: true, message: 'Cache cleared for lazy rebuild' };
     } catch (error) {
-      console.error('❌ WORKER - Index rebuild failed:', error);
+      console.error('❌ WORKER - Cache invalidation failed:', error);
       throw error;
     }
   }
@@ -1245,7 +1158,7 @@ async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId,
     
     if (completedBatches.length === totalBatches) {
       console.log('🎉 ALL BATCHES COMPLETED - Starting finalization');
-      
+
       // Aggregate results
       const totalResults = completedBatches.reduce((acc, batch) => ({
         created: acc.created + (batch.created || 0),
@@ -1254,11 +1167,12 @@ async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId,
         errors: acc.errors + (batch.errors || 0),
         contacts: acc.contacts + (batch.contacts || 0)
       }), { created: 0, duplicatesUpdated: 0, skippedDuplicates: 0, errors: 0, contacts: 0 });
-      
-      // Rebuild contact indexes
-      console.log('🔄 WORKER FINALIZATION - Rebuilding contact indexes');
-      await contactService.forceRebuildMetadata(orgId);
-      
+
+      // OPTIMIZATION: Skip cache rebuild in worker to avoid KV rate limits and slow dashboard loads
+      // The dashboard will rebuild cache lazily on first access (Pages Functions have no KV limits)
+      // Contact metadata/statistics are already accurate from incremental updates during batch processing
+      console.log('✅ WORKER FINALIZATION - Skipping cache rebuild (dashboard will rebuild on first access)');
+
       // Update final upload status
       const uploadKey = `org:${orgId}:upload_status:${uploadId}`;
       await kvService.setCache(uploadKey, {
@@ -1277,7 +1191,7 @@ async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId,
         },
         completedAt: new Date().toISOString()
       }, 7200);
-      
+
       console.log('✅ WORKER FINALIZATION COMPLETE - Upload finished:', totalResults);
     }
   } catch (error) {
