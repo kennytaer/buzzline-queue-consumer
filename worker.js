@@ -912,53 +912,99 @@ async function processContactDeletion(message, kvService) {
 async function processBulkDeleteOrgData(message, kvService) {
   const { orgId, deletionId, prefixesToDelete } = message;
 
-  console.log(`🗑️ BULK DELETE ORG DATA - Starting deletion for org: ${orgId}`);
+  console.log(`🗑️ BULK DELETE ORG DATA - Starting deletion for org: ${orgId}, deletionId: ${deletionId}`);
   console.log(`🗑️ BULK DELETE - Prefixes to delete:`, prefixesToDelete);
 
   try {
-    let totalDeletedKeys = 0;
     const contactService = new ContactService(kvService.env);
+    const progressKey = `org:${orgId}:deletion_progress:${deletionId}`;
 
-    // Process each prefix
-    for (const prefix of prefixesToDelete) {
-      console.log(`🗑️ BULK DELETE - Processing prefix: ${prefix}`);
-      let deletedForPrefix = 0;
-      let cursor = undefined;
-
-      do {
-        // List keys with this prefix
-        const list = await kvService.main.list({prefix, limit: 1000, cursor });
-
-        console.log(`📋 BULK DELETE - Found ${list.keys.length} keys for prefix: ${prefix}`);
-
-        // Delete in batches of 20
-        const DELETE_BATCH_SIZE = 20;
-        for (let i = 0; i < list.keys.length; i += DELETE_BATCH_SIZE) {
-          const batch = list.keys.slice(i, i + DELETE_BATCH_SIZE);
-
-          await Promise.all(batch.map(key => kvService.main.delete(key.name)));
-
-          deletedForPrefix += batch.length;
-
-          // Small delay to avoid overwhelming KV
-          if (i + DELETE_BATCH_SIZE < list.keys.length) {
-            await new Promise(resolve => setTimeout(resolve, 100));
-          }
-        }
-
-        cursor = list.list_complete ? undefined : list.cursor;
-
-      } while (cursor);
-
-      console.log(`✅ BULK DELETE - Deleted ${deletedForPrefix} keys for prefix: ${prefix}`);
-      totalDeletedKeys += deletedForPrefix;
+    // Get or initialize deletion progress
+    let progress = await kvService.getCache(progressKey);
+    if (!progress) {
+      progress = {
+        deletionId,
+        orgId,
+        prefixesToDelete,
+        processedPrefixes: [],
+        totalDeleted: 0,
+        startedAt: new Date().toISOString()
+      };
     }
 
-    // Reset metadata to 0
-    const metadataOperations = [{ type: 'bulk_delete', count: totalDeletedKeys }];
-    await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
+    console.log(`🗑️ BULK DELETE - Progress: ${progress.processedPrefixes.length}/${prefixesToDelete.length} prefixes complete, ${progress.totalDeleted} keys deleted`);
 
-    console.log(`✅ BULK DELETE ORG DATA COMPLETE - Deleted ${totalDeletedKeys} keys for org: ${orgId}`);
+    const MAX_DELETES_PER_INVOCATION = 100; // Conservative limit
+    let deletedThisInvocation = 0;
+
+    // Process each prefix that hasn't been completed yet
+    for (const prefix of prefixesToDelete) {
+      // Skip if already processed
+      if (progress.processedPrefixes.includes(prefix)) {
+        console.log(`⏭️ BULK DELETE - Skipping already processed prefix: ${prefix}`);
+        continue;
+      }
+
+      console.log(`🗑️ BULK DELETE - Processing prefix: ${prefix}`);
+
+      // Check if we're approaching KV limits
+      const remainingOps = kvService.maxOperations - kvService.operationCount;
+      if (remainingOps < 50 || deletedThisInvocation >= MAX_DELETES_PER_INVOCATION) {
+        console.warn(`⚠️ BULK DELETE - Approaching limits (remainingOps: ${remainingOps}, deleted: ${deletedThisInvocation}), saving progress and retrying`);
+        await kvService.setCache(progressKey, progress, 3600);
+        throw new Error('KV limits approaching - saving progress and retrying');
+      }
+
+      // List a small batch of keys
+      const list = await kvService.main.list({ prefix, limit: 100 });
+      console.log(`📋 BULK DELETE - Found ${list.keys.length} keys for prefix: ${prefix} (list_complete: ${list.list_complete})`);
+
+      if (list.keys.length === 0 && list.list_complete) {
+        // No keys found, mark prefix as complete
+        progress.processedPrefixes.push(prefix);
+        console.log(`✅ BULK DELETE - Prefix complete (no keys found): ${prefix}`);
+        continue;
+      }
+
+      // Delete in batches of 20
+      const DELETE_BATCH_SIZE = 20;
+      for (let i = 0; i < list.keys.length; i += DELETE_BATCH_SIZE) {
+        const batch = list.keys.slice(i, i + DELETE_BATCH_SIZE);
+        await Promise.all(batch.map(key => kvService.main.delete(key.name)));
+        deletedThisInvocation += batch.length;
+        progress.totalDeleted += batch.length;
+      }
+
+      console.log(`✅ BULK DELETE - Deleted ${list.keys.length} keys for prefix: ${prefix} (total: ${progress.totalDeleted})`);
+
+      // If this prefix is complete, mark it as processed
+      if (list.list_complete) {
+        progress.processedPrefixes.push(prefix);
+        console.log(`✅ BULK DELETE - Prefix complete: ${prefix}`);
+      } else {
+        // More keys remain for this prefix - save progress and retry
+        console.log(`🔄 BULK DELETE - More keys remain for prefix: ${prefix}, saving progress and retrying`);
+        await kvService.setCache(progressKey, progress, 3600);
+        throw new Error('Prefix not complete - saving progress and retrying');
+      }
+    }
+
+    // Check if all prefixes are processed
+    if (progress.processedPrefixes.length === prefixesToDelete.length) {
+      // All prefixes complete - reset metadata to 0 and clean up progress
+      const metadataOperations = [{ type: 'bulk_delete', count: progress.totalDeleted }];
+      await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
+
+      // Delete progress tracker
+      await kvService.cache.delete(progressKey);
+
+      console.log(`✅ BULK DELETE ORG DATA COMPLETE - Deleted ${progress.totalDeleted} keys for org: ${orgId}`);
+    } else {
+      // Not all prefixes complete - save progress and retry
+      await kvService.setCache(progressKey, progress, 3600);
+      console.log(`🔄 BULK DELETE - Saved progress: ${progress.processedPrefixes.length}/${prefixesToDelete.length} prefixes complete`);
+      throw new Error('Bulk delete incomplete - retrying to continue');
+    }
 
   } catch (error) {
     console.error(`❌ BULK DELETE ORG DATA - Failed for org ${orgId}:`, error);
