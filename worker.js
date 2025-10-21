@@ -72,9 +72,10 @@ class KVService {
 // Message types for unified queue processing
 const MESSAGE_TYPES = {
   CONTACT_BATCH: 'contact_batch',
-  CAMPAIGN_SEND: 'campaign_send', 
+  CAMPAIGN_SEND: 'campaign_send',
   CONTACT_DELETE: 'contact_delete',
-  OPT_OUT_BATCH: 'opt_out_batch'
+  OPT_OUT_BATCH: 'opt_out_batch',
+  BULK_DELETE_ORG_DATA: 'bulk_delete_org_data'
 };
 
 // Contact metadata management
@@ -907,6 +908,64 @@ async function processContactDeletion(message, kvService) {
   }
 }
 
+// Bulk delete all org data (worker enumerates and deletes in batches)
+async function processBulkDeleteOrgData(message, kvService) {
+  const { orgId, deletionId, prefixesToDelete } = message;
+
+  console.log(`🗑️ BULK DELETE ORG DATA - Starting deletion for org: ${orgId}`);
+  console.log(`🗑️ BULK DELETE - Prefixes to delete:`, prefixesToDelete);
+
+  try {
+    let totalDeletedKeys = 0;
+    const contactService = new ContactService(kvService.env);
+
+    // Process each prefix
+    for (const prefix of prefixesToDelete) {
+      console.log(`🗑️ BULK DELETE - Processing prefix: ${prefix}`);
+      let deletedForPrefix = 0;
+      let cursor = undefined;
+
+      do {
+        // List keys with this prefix
+        const list = await kvService.main.list({prefix, limit: 1000, cursor });
+
+        console.log(`📋 BULK DELETE - Found ${list.keys.length} keys for prefix: ${prefix}`);
+
+        // Delete in batches of 20
+        const DELETE_BATCH_SIZE = 20;
+        for (let i = 0; i < list.keys.length; i += DELETE_BATCH_SIZE) {
+          const batch = list.keys.slice(i, i + DELETE_BATCH_SIZE);
+
+          await Promise.all(batch.map(key => kvService.main.delete(key.name)));
+
+          deletedForPrefix += batch.length;
+
+          // Small delay to avoid overwhelming KV
+          if (i + DELETE_BATCH_SIZE < list.keys.length) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+          }
+        }
+
+        cursor = list.list_complete ? undefined : list.cursor;
+
+      } while (cursor);
+
+      console.log(`✅ BULK DELETE - Deleted ${deletedForPrefix} keys for prefix: ${prefix}`);
+      totalDeletedKeys += deletedForPrefix;
+    }
+
+    // Reset metadata to 0
+    const metadataOperations = [{ type: 'bulk_delete', count: totalDeletedKeys }];
+    await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
+
+    console.log(`✅ BULK DELETE ORG DATA COMPLETE - Deleted ${totalDeletedKeys} keys for org: ${orgId}`);
+
+  } catch (error) {
+    console.error(`❌ BULK DELETE ORG DATA - Failed for org ${orgId}:`, error);
+    throw error;
+  }
+}
+
 async function processContactBatch(message, kvService) {
   const { uploadId, orgId, listId, listName, batchNumber, totalBatches, contacts, reactivateDuplicates } = message;
   
@@ -1239,6 +1298,10 @@ export default {
         case MESSAGE_TYPES.OPT_OUT_BATCH:
           estimatedOps = (message.body.optOuts?.length || 0) * 3;
           break;
+        case MESSAGE_TYPES.BULK_DELETE_ORG_DATA:
+          // Bulk delete will enumerate keys dynamically, estimate conservatively
+          estimatedOps = 500;
+          break;
         default:
           estimatedOps = 100;
       }
@@ -1296,6 +1359,9 @@ export default {
                 break;
               case MESSAGE_TYPES.OPT_OUT_BATCH:
                 await processOptOutBatch(message.body, kvService);
+                break;
+              case MESSAGE_TYPES.BULK_DELETE_ORG_DATA:
+                await processBulkDeleteOrgData(message.body, kvService);
                 break;
               default:
                 throw new Error(`Unknown message type: ${message.body.type}`);
@@ -1383,6 +1449,9 @@ export default {
               break;
             case MESSAGE_TYPES.OPT_OUT_BATCH:
               await processOptOutBatch(message.body, kvService);
+              break;
+            case MESSAGE_TYPES.BULK_DELETE_ORG_DATA:
+              await processBulkDeleteOrgData(message.body, kvService);
               break;
             default:
               throw new Error(`Unknown message type: ${message.body.type}`);
