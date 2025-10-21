@@ -936,6 +936,7 @@ async function processBulkDeleteOrgData(message, kvService) {
 
     const MAX_DELETES_PER_INVOCATION = 100; // Conservative limit
     let deletedThisInvocation = 0;
+    let needsContinuation = false;
 
     // Process each prefix that hasn't been completed yet
     for (const prefix of prefixesToDelete) {
@@ -950,9 +951,9 @@ async function processBulkDeleteOrgData(message, kvService) {
       // Check if we're approaching KV limits
       const remainingOps = kvService.maxOperations - kvService.operationCount;
       if (remainingOps < 50 || deletedThisInvocation >= MAX_DELETES_PER_INVOCATION) {
-        console.warn(`⚠️ BULK DELETE - Approaching limits (remainingOps: ${remainingOps}, deleted: ${deletedThisInvocation}), saving progress and retrying`);
-        await kvService.setCache(progressKey, progress, 3600);
-        throw new Error('KV limits approaching - saving progress and retrying');
+        console.warn(`⚠️ BULK DELETE - Approaching limits (remainingOps: ${remainingOps}, deleted: ${deletedThisInvocation}), will continue in next invocation`);
+        needsContinuation = true;
+        break; // Don't process more prefixes, queue continuation
       }
 
       // List a small batch of keys
@@ -982,12 +983,15 @@ async function processBulkDeleteOrgData(message, kvService) {
         progress.processedPrefixes.push(prefix);
         console.log(`✅ BULK DELETE - Prefix complete: ${prefix}`);
       } else {
-        // More keys remain for this prefix - save progress and retry
-        console.log(`🔄 BULK DELETE - More keys remain for prefix: ${prefix}, saving progress and retrying`);
-        await kvService.setCache(progressKey, progress, 3600);
-        throw new Error('Prefix not complete - saving progress and retrying');
+        // More keys remain for this prefix - need to continue
+        console.log(`🔄 BULK DELETE - More keys remain for prefix: ${prefix}, will continue in next invocation`);
+        needsContinuation = true;
+        break; // Stop processing, queue continuation
       }
     }
+
+    // Save progress
+    await kvService.setCache(progressKey, progress, 3600);
 
     // Check if all prefixes are processed
     if (progress.processedPrefixes.length === prefixesToDelete.length) {
@@ -999,11 +1003,18 @@ async function processBulkDeleteOrgData(message, kvService) {
       await kvService.cache.delete(progressKey);
 
       console.log(`✅ BULK DELETE ORG DATA COMPLETE - Deleted ${progress.totalDeleted} keys for org: ${orgId}`);
-    } else {
-      // Not all prefixes complete - save progress and retry
-      await kvService.setCache(progressKey, progress, 3600);
-      console.log(`🔄 BULK DELETE - Saved progress: ${progress.processedPrefixes.length}/${prefixesToDelete.length} prefixes complete`);
-      throw new Error('Bulk delete incomplete - retrying to continue');
+    } else if (needsContinuation) {
+      // Queue a new message to continue deletion (avoid retry limits)
+      console.log(`🔄 BULK DELETE - Queueing continuation message (${progress.processedPrefixes.length}/${prefixesToDelete.length} prefixes complete)`);
+
+      await kvService.env.CONTACT_PROCESSING_QUEUE.send({
+        type: 'bulk_delete_org_data',
+        orgId,
+        deletionId,
+        prefixesToDelete
+      });
+
+      console.log(`✅ BULK DELETE - Continuation message queued successfully`);
     }
 
   } catch (error) {
