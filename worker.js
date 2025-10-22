@@ -228,7 +228,7 @@ class ContactMetadataService {
   // Rebuild metadata from scratch by scanning all contacts
   async rebuildContactMetadata(orgId) {
     console.log('🔄 REBUILDING CONTACT METADATA for org:', orgId);
-    
+
     const prefix = `org:${orgId}:contact:`;
     const metadata = {
       totalContacts: 0,
@@ -240,34 +240,57 @@ class ContactMetadataService {
       lastUpdated: new Date().toISOString(),
       version: 1
     };
-    
+
     let cursor = undefined;
+    let batchNumber = 0;
+
     do {
-      const list = await this.kv.main.list({ prefix, limit: 1000, cursor });
-      
-      // Process contacts in this batch
-      const batchPromises = list.keys.map(async (key) => {
-        try {
-          const contactData = await this.kv.main.get(key.name);
-          return contactData ? JSON.parse(contactData) : null;
-        } catch (error) {
-          console.error('Failed to parse contact:', error);
-          return null;
+      batchNumber++;
+      // Use smaller batch size to avoid rate limits (Workers: 1000 reads/sec limit)
+      const list = await this.kv.main.list({ prefix, limit: 500, cursor });
+
+      console.log(`📊 Metadata rebuild batch ${batchNumber}: ${list.keys.length} contacts`);
+
+      // Process contacts in smaller chunks to avoid rate limits
+      const CHUNK_SIZE = 100;
+      const allContacts = [];
+
+      for (let i = 0; i < list.keys.length; i += CHUNK_SIZE) {
+        const chunk = list.keys.slice(i, i + CHUNK_SIZE);
+        const chunkPromises = chunk.map(async (key) => {
+          try {
+            const contactData = await this.kv.main.get(key.name);
+            return contactData ? JSON.parse(contactData) : null;
+          } catch (error) {
+            console.error('Failed to parse contact:', error);
+            return null;
+          }
+        });
+
+        const chunkResults = await Promise.all(chunkPromises);
+        allContacts.push(...chunkResults.filter(Boolean));
+
+        // Small delay between chunks to avoid rate limits (100 reads per 100ms = 1000 reads/sec max)
+        if (i + CHUNK_SIZE < list.keys.length) {
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
-      });
-      
-      const contacts = (await Promise.all(batchPromises)).filter(Boolean);
-      
+      }
+
       // Update metadata with this batch
-      this.applyBulkAddOperation(metadata, contacts);
-      
+      this.applyBulkAddOperation(metadata, allContacts);
+
       cursor = list.list_complete ? undefined : list.cursor;
+
+      // Delay between batches to stay under rate limits
+      if (cursor) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
     } while (cursor);
-    
+
     // Save rebuilt metadata
     const metaKey = `org:${orgId}:contact_metadata`;
     await this.kv.put(metaKey, metadata);
-    
+
     console.log('✅ METADATA REBUILT:', metadata);
     return metadata;
   }
@@ -789,15 +812,10 @@ async function processOptOutBatch(message, kvService) {
             
             const contactKey = `org:${orgId}:contact:${contact.id}`;
             await kvService.put(contactKey, updatedContact);
-            
-            // Update metadata
-            const metadataOperations = [{
-              type: 'update',
-              oldContact: contact,
-              newContact: updatedContact
-            }];
-            await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
-            
+
+            // NOTE: Metadata incremental updates removed to avoid race conditions
+            // Metadata will be rebuilt from scratch after all batches complete
+
             console.log(`✅ Opted out contact: ${contact.id} (${email || phone})`);
             return { success: true };
           } else {
@@ -827,17 +845,62 @@ async function processOptOutBatch(message, kvService) {
     }
     
     console.log(`✅ OPT-OUT BATCH ${batchNumber}/${totalBatches} - Processed: ${processedCount}, Errors: ${errorCount}`);
-    
+
     // Mark batch as completed
     await updateBatchStatus(kvService, orgId, 'opt_out', batchNumber, 'completed', {
       processed: processedCount,
       errors: errorCount,
       completedAt: new Date().toISOString()
     });
-    
+
+    // Check if all batches are complete and finalize
+    await checkAndFinalizeOptOutBatches(kvService, contactService, orgId, totalBatches);
+
   } catch (error) {
     console.error(`❌ OPT-OUT BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
     throw error;
+  }
+}
+
+// Check and finalize opt-out batches
+async function checkAndFinalizeOptOutBatches(kvService, contactService, orgId, totalBatches) {
+  try {
+    // Check if all batches are completed
+    const completedBatches = [];
+    for (let i = 1; i <= totalBatches; i++) {
+      const batchKey = `org:${orgId}:opt_out_batch:opt_out:${i}`;
+      const batchStatus = await kvService.getCache(batchKey);
+      if (batchStatus?.status === 'completed') {
+        completedBatches.push(batchStatus);
+      }
+    }
+
+    console.log(`📊 OPT-OUT FINALIZE CHECK - Batches completed: ${completedBatches.length}/${totalBatches}`);
+
+    if (completedBatches.length === totalBatches) {
+      console.log('🎉 ALL OPT-OUT BATCHES COMPLETED - Starting finalization');
+
+      // Rebuild metadata to ensure accurate counts (fixes race condition)
+      console.log('🔄 OPT-OUT FINALIZATION - Rebuilding contact metadata...');
+      try {
+        await contactService.metadataService.rebuildContactMetadata(orgId);
+        console.log('✅ OPT-OUT FINALIZATION - Contact metadata rebuilt successfully');
+      } catch (metadataError) {
+        console.error('❌ OPT-OUT FINALIZATION - Failed to rebuild metadata:', metadataError);
+      }
+
+      // Invalidate dashboard cache
+      try {
+        await contactService.forceRebuildMetadata(orgId);
+        console.log('✅ OPT-OUT FINALIZATION - Dashboard cache invalidated');
+      } catch (cacheError) {
+        console.error('❌ OPT-OUT FINALIZATION - Failed to invalidate cache:', cacheError);
+      }
+
+      console.log('✅ OPT-OUT FINALIZATION COMPLETE');
+    }
+  } catch (error) {
+    console.error('❌ OPT-OUT FINALIZATION FAILED:', error);
   }
 }
 
@@ -883,28 +946,63 @@ async function processContactDeletion(message, kvService) {
     }
     
     console.log(`✅ DELETE BATCH ${batchNumber}/${totalBatches} - Deleted: ${deletedCount}, Errors: ${errorCount}`);
-    
-    // Update contact metadata for deletions (check if this is the final batch)
-    if (batchNumber === totalBatches) {
-      // For the last batch, reset metadata to 0 since we're deleting all contacts
-      const contactService = new ContactService(kvService.env);
-      const metadataOperations = [{
-        type: 'bulk_delete',
-        count: deletedCount
-      }];
-      await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
-    }
-    
+
     // Mark batch as completed
     await updateBatchStatus(kvService, orgId, 'deletion', batchNumber, 'completed', {
       deleted: deletedCount,
       errors: errorCount,
       completedAt: new Date().toISOString()
     });
-    
+
+    // Check if all batches are complete and finalize
+    const contactService = new ContactService(kvService.env);
+    await checkAndFinalizeContactDeletion(kvService, contactService, orgId, totalBatches);
+
   } catch (error) {
     console.error(`❌ DELETE BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
     throw error;
+  }
+}
+
+// Check and finalize contact deletion batches
+async function checkAndFinalizeContactDeletion(kvService, contactService, orgId, totalBatches) {
+  try {
+    // Check if all batches are completed
+    const completedBatches = [];
+    for (let i = 1; i <= totalBatches; i++) {
+      const batchKey = `org:${orgId}:deletion_batch:deletion:${i}`;
+      const batchStatus = await kvService.getCache(batchKey);
+      if (batchStatus?.status === 'completed') {
+        completedBatches.push(batchStatus);
+      }
+    }
+
+    console.log(`📊 DELETION FINALIZE CHECK - Batches completed: ${completedBatches.length}/${totalBatches}`);
+
+    if (completedBatches.length === totalBatches) {
+      console.log('🎉 ALL DELETION BATCHES COMPLETED - Starting finalization');
+
+      // Rebuild metadata to ensure accurate counts (fixes race condition)
+      console.log('🔄 DELETION FINALIZATION - Rebuilding contact metadata...');
+      try {
+        await contactService.metadataService.rebuildContactMetadata(orgId);
+        console.log('✅ DELETION FINALIZATION - Contact metadata rebuilt successfully');
+      } catch (metadataError) {
+        console.error('❌ DELETION FINALIZATION - Failed to rebuild metadata:', metadataError);
+      }
+
+      // Invalidate dashboard cache
+      try {
+        await contactService.forceRebuildMetadata(orgId);
+        console.log('✅ DELETION FINALIZATION - Dashboard cache invalidated');
+      } catch (cacheError) {
+        console.error('❌ DELETION FINALIZATION - Failed to invalidate cache:', cacheError);
+      }
+
+      console.log('✅ DELETION FINALIZATION COMPLETE');
+    }
+  } catch (error) {
+    console.error('❌ DELETION FINALIZATION FAILED:', error);
   }
 }
 
@@ -995,9 +1093,22 @@ async function processBulkDeleteOrgData(message, kvService) {
 
     // Check if all prefixes are processed
     if (progress.processedPrefixes.length === prefixesToDelete.length) {
-      // All prefixes complete - reset metadata to 0 and clean up progress
-      const metadataOperations = [{ type: 'bulk_delete', count: progress.totalDeleted }];
-      await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
+      // All prefixes complete - rebuild metadata and clean up progress
+      console.log('🔄 BULK DELETE FINALIZATION - Rebuilding contact metadata...');
+      try {
+        await contactService.metadataService.rebuildContactMetadata(orgId);
+        console.log('✅ BULK DELETE FINALIZATION - Contact metadata rebuilt successfully');
+      } catch (metadataError) {
+        console.error('❌ BULK DELETE FINALIZATION - Failed to rebuild metadata:', metadataError);
+      }
+
+      // Invalidate dashboard cache
+      try {
+        await contactService.forceRebuildMetadata(orgId);
+        console.log('✅ BULK DELETE FINALIZATION - Dashboard cache invalidated');
+      } catch (cacheError) {
+        console.error('❌ BULK DELETE FINALIZATION - Failed to invalidate cache:', cacheError);
+      }
 
       // Delete progress tracker
       await kvService.cache.delete(progressKey);
@@ -1214,14 +1325,10 @@ async function processContactBatch(message, kvService) {
       kvOperationsUsed: kvService.operationCount,
       kvOperationsRemaining: kvService.maxOperations - kvService.operationCount
     });
-    
-    // Update contact metadata for this batch
-    const metadataOperations = [{
-      type: 'bulk_add',
-      contacts: results.created
-    }];
-    await contactService.metadataService.updateContactMetadata(orgId, metadataOperations);
-    
+
+    // NOTE: Metadata incremental updates removed to avoid race conditions
+    // Metadata will be rebuilt from scratch after all batches complete in finalization
+
     // Check if this was the last batch and trigger final processing
     await checkAndFinalizeBatch(kvService, contactService, orgId, uploadId, listId, totalBatches);
     
@@ -1284,10 +1391,25 @@ async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId,
         contacts: acc.contacts + (batch.contacts || 0)
       }), { created: 0, duplicatesUpdated: 0, skippedDuplicates: 0, errors: 0, contacts: 0 });
 
-      // OPTIMIZATION: Skip cache rebuild in worker to avoid KV rate limits and slow dashboard loads
-      // The dashboard will rebuild cache lazily on first access (Pages Functions have no KV limits)
-      // Contact metadata/statistics are already accurate from incremental updates during batch processing
-      console.log('✅ WORKER FINALIZATION - Skipping cache rebuild (dashboard will rebuild on first access)');
+      // CRITICAL FIX: Rebuild contact metadata to fix race condition in incremental updates
+      // Incremental updates from parallel batches suffer from read-modify-write race conditions
+      // This ensures accurate counts by scanning all contacts (now with rate limiting)
+      console.log('🔄 WORKER FINALIZATION - Rebuilding contact metadata for accurate counts...');
+      try {
+        await contactService.metadataService.rebuildContactMetadata(orgId);
+        console.log('✅ WORKER FINALIZATION - Contact metadata rebuilt successfully');
+      } catch (metadataError) {
+        console.error('❌ WORKER FINALIZATION - Failed to rebuild metadata:', metadataError);
+        // Don't fail the entire upload for metadata rebuild issues
+      }
+
+      // Invalidate dashboard cache so it rebuilds with fresh data
+      try {
+        await contactService.forceRebuildMetadata(orgId);
+        console.log('✅ WORKER FINALIZATION - Dashboard cache invalidated');
+      } catch (cacheError) {
+        console.error('❌ WORKER FINALIZATION - Failed to invalidate cache:', cacheError);
+      }
 
       // Update final upload status
       const uploadKey = `org:${orgId}:upload_status:${uploadId}`;
