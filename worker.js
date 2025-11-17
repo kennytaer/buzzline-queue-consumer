@@ -78,6 +78,17 @@ class KVService {
     }
   }
 
+  async delete(key) {
+    this.checkRateLimit();
+    try {
+      this.incrementOperationCount();
+      await this.main.delete(key);
+    } catch (error) {
+      console.error('KV main delete error:', error);
+      throw error;
+    }
+  }
+
   async listMain(options = {}) {
     this.checkRateLimit();
     try {
@@ -1324,7 +1335,6 @@ async function processBulkDeleteOrgData(message, kvService) {
   console.log(`🗑️ BULK DELETE - Prefixes to delete:`, prefixesToDelete);
 
   try {
-    const contactService = new ContactService(kvService.env);
     const progressKey = `org:${orgId}:deletion_progress:${deletionId}`;
 
     // Get or initialize deletion progress
@@ -1336,13 +1346,20 @@ async function processBulkDeleteOrgData(message, kvService) {
         prefixesToDelete,
         processedPrefixes: [],
         totalDeleted: 0,
+        prefixState: {},
         startedAt: new Date().toISOString()
       };
     }
 
+    progress.prefixState = progress.prefixState || {};
+
     console.log(`🗑️ BULK DELETE - Progress: ${progress.processedPrefixes.length}/${prefixesToDelete.length} prefixes complete, ${progress.totalDeleted} keys deleted`);
 
-    const MAX_DELETES_PER_INVOCATION = 100; // Conservative limit
+    const BULK_DELETE_LIST_LIMIT = 200;
+    const BULK_DELETE_DELETE_BATCH = 50;
+    const BULK_DELETE_MAX_DELETES = 800;
+    const BULK_DELETE_KV_BUFFER = 100;
+
     let deletedThisInvocation = 0;
     let needsContinuation = false;
 
@@ -1356,45 +1373,74 @@ async function processBulkDeleteOrgData(message, kvService) {
 
       console.log(`🗑️ BULK DELETE - Processing prefix: ${prefix}`);
 
-      // Check if we're approaching KV limits
-      const remainingOps = kvService.maxOperations - kvService.operationCount;
-      if (remainingOps < 50 || deletedThisInvocation >= MAX_DELETES_PER_INVOCATION) {
-        console.warn(`⚠️ BULK DELETE - Approaching limits (remainingOps: ${remainingOps}, deleted: ${deletedThisInvocation}), will continue in next invocation`);
-        needsContinuation = true;
-        break; // Don't process more prefixes, queue continuation
+      const prefixState = progress.prefixState[prefix] || { cursor: undefined };
+      let continuePrefix = true;
+
+      while (continuePrefix) {
+        if (deletedThisInvocation >= BULK_DELETE_MAX_DELETES || shouldYieldForKvBudget(kvService, BULK_DELETE_KV_BUFFER)) {
+          needsContinuation = true;
+          break;
+        }
+
+        const listOptions = { prefix, limit: BULK_DELETE_LIST_LIMIT };
+        if (prefixState.cursor) {
+          listOptions.cursor = prefixState.cursor;
+        }
+
+        const list = await kvService.listMain(listOptions);
+        console.log(`📋 BULK DELETE - Found ${list.keys.length} keys for prefix: ${prefix} (list_complete: ${list.list_complete}, cursor: ${!!list.cursor})`);
+
+        if (list.keys.length === 0) {
+          if (list.list_complete) {
+            progress.processedPrefixes.push(prefix);
+            delete progress.prefixState[prefix];
+            console.log(`✅ BULK DELETE - Prefix complete (no keys found): ${prefix}`);
+          } else {
+            prefixState.cursor = list.cursor;
+            progress.prefixState[prefix] = prefixState;
+            needsContinuation = true;
+          }
+          break;
+        }
+
+        const keyNames = list.keys.map(key => key.name);
+        for (let i = 0; i < keyNames.length; i += BULK_DELETE_DELETE_BATCH) {
+          const chunk = keyNames.slice(i, i + BULK_DELETE_DELETE_BATCH);
+          await Promise.allSettled(chunk.map(keyName => kvService.delete(keyName)));
+          deletedThisInvocation += chunk.length;
+          progress.totalDeleted += chunk.length;
+
+          if (deletedThisInvocation >= BULK_DELETE_MAX_DELETES || shouldYieldForKvBudget(kvService, BULK_DELETE_KV_BUFFER)) {
+            prefixState.cursor = list.list_complete && (i + BULK_DELETE_DELETE_BATCH >= keyNames.length) ? undefined : list.cursor;
+            progress.prefixState[prefix] = prefixState;
+            needsContinuation = true;
+            continuePrefix = false;
+            break;
+          }
+        }
+
+        if (!continuePrefix && needsContinuation) {
+          break;
+        }
+
+        if (list.list_complete) {
+          progress.processedPrefixes.push(prefix);
+          delete progress.prefixState[prefix];
+          console.log(`✅ BULK DELETE - Prefix complete: ${prefix}`);
+          break;
+        } else {
+          prefixState.cursor = list.cursor;
+          progress.prefixState[prefix] = prefixState;
+          // Continue loop to process next page if we still have budget
+          if (deletedThisInvocation >= BULK_DELETE_MAX_DELETES || shouldYieldForKvBudget(kvService, BULK_DELETE_KV_BUFFER)) {
+            needsContinuation = true;
+            break;
+          }
+        }
       }
 
-      // List a small batch of keys
-      const list = await kvService.main.list({ prefix, limit: 100 });
-      console.log(`📋 BULK DELETE - Found ${list.keys.length} keys for prefix: ${prefix} (list_complete: ${list.list_complete})`);
-
-      if (list.keys.length === 0 && list.list_complete) {
-        // No keys found, mark prefix as complete
-        progress.processedPrefixes.push(prefix);
-        console.log(`✅ BULK DELETE - Prefix complete (no keys found): ${prefix}`);
-        continue;
-      }
-
-      // Delete in batches of 20
-      const DELETE_BATCH_SIZE = 20;
-      for (let i = 0; i < list.keys.length; i += DELETE_BATCH_SIZE) {
-        const batch = list.keys.slice(i, i + DELETE_BATCH_SIZE);
-        await Promise.all(batch.map(key => kvService.main.delete(key.name)));
-        deletedThisInvocation += batch.length;
-        progress.totalDeleted += batch.length;
-      }
-
-      console.log(`✅ BULK DELETE - Deleted ${list.keys.length} keys for prefix: ${prefix} (total: ${progress.totalDeleted})`);
-
-      // If this prefix is complete, mark it as processed
-      if (list.list_complete) {
-        progress.processedPrefixes.push(prefix);
-        console.log(`✅ BULK DELETE - Prefix complete: ${prefix}`);
-      } else {
-        // More keys remain for this prefix - need to continue
-        console.log(`🔄 BULK DELETE - More keys remain for prefix: ${prefix}, will continue in next invocation`);
-        needsContinuation = true;
-        break; // Stop processing, queue continuation
+      if (needsContinuation) {
+        break;
       }
     }
 
