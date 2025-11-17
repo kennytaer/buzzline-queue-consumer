@@ -1168,71 +1168,77 @@ async function processContactBatch(message, kvService) {
       startTime: new Date().toISOString()
     });
 
-    // PHASE 3 REVISED: Parallel duplicate checking using direct KV lookups
-    console.log(`📊 PHASE 3 - Checking duplicates using parallel KV lookups`);
+    // PHASE 3: Use isDuplicate flags from message (duplicate checking done upfront in upload handler)
+    console.log(`📊 PHASE 3 - Using pre-computed duplicate flags from upload handler`);
 
-    // Build all KV lookup promises in parallel
-    const duplicateCheckPromises = contacts.map(async ({rowIndex, contact, contactId}) => {
-      let existingContact = null;
+    // Fetch all existing contacts for duplicates in this batch (in parallel)
+    const duplicateContactIds = contacts
+      .filter(c => c.isDuplicate && c.existingContactId)
+      .map(c => c.existingContactId);
 
-      // Check email index (parallel)
-      if (contact.email) {
-        const emailKey = `org:${orgId}:contact_by_email:${contact.email.toLowerCase()}`;
-        const emailContact = await contactService.kv.get(emailKey);
-        if (emailContact) {
-          existingContact = emailContact;
+    const existingContactMap = new Map();
+    if (duplicateContactIds.length > 0) {
+      console.log(`📦 PHASE 3 - Fetching ${duplicateContactIds.length} existing contacts for duplicates`);
+
+      // Fetch all duplicate contacts in parallel
+      const existingContactPromises = duplicateContactIds.map(async (contactId) => {
+        try {
+          const contactKey = `org:${orgId}:contact:${contactId}`;
+          const contactData = await contactService.kv.get(contactKey);
+          if (contactData) {
+            const contact = JSON.parse(contactData);
+            return { id: contactId, contact };
+          }
+        } catch (error) {
+          console.error(`Failed to fetch contact ${contactId}:`, error);
         }
-      }
+        return null;
+      });
 
-      // Check phone index if no email match (only if needed)
-      if (!existingContact && contact.phone) {
-        const phoneKey = `org:${orgId}:contact_by_phone:${contact.phone}`;
-        const phoneContact = await contactService.kv.get(phoneKey);
-        if (phoneContact) {
-          existingContact = phoneContact;
+      const existingContactsResults = await Promise.all(existingContactPromises);
+
+      existingContactsResults.forEach(result => {
+        if (result && result.contact) {
+          existingContactMap.set(result.id, result.contact);
         }
-      }
+      });
 
-      return {
-        rowIndex,
-        contact,
-        contactId,
-        existingContact
-      };
-    });
+      console.log(`✅ PHASE 3 - Fetched ${existingContactMap.size} existing contacts`);
+    }
 
-    // Execute all duplicate checks in parallel
-    const duplicateCheckResults = await Promise.all(duplicateCheckPromises);
-
-    // Separate new contacts from duplicates based on results
+    // Separate new contacts from duplicates based on pre-computed flags
     const newContacts = [];
     const duplicateUpdates = [];
 
-    for (const {rowIndex, contact, contactId, existingContact} of duplicateCheckResults) {
-      if (existingContact) {
-        // Handle duplicate
-        const updatedListIds = existingContact.contactListIds || [];
-        if (!updatedListIds.includes(listId)) {
-          updatedListIds.push(listId);
+    for (const {rowIndex, contact, contactId, isDuplicate, existingContactId} of contacts) {
+      if (isDuplicate && existingContactId) {
+        const existingContact = existingContactMap.get(existingContactId);
+
+        if (existingContact) {
+          // Handle duplicate - merge data
+          const updatedListIds = existingContact.contactListIds || [];
+          if (!updatedListIds.includes(listId)) {
+            updatedListIds.push(listId);
+          }
+
+          const mergedMetadata = { ...existingContact.metadata, ...contact.metadata };
+
+          const updates = {
+            firstName: contact.firstName || existingContact.firstName,
+            lastName: contact.lastName || existingContact.lastName,
+            email: contact.email || existingContact.email,
+            phone: contact.phone || existingContact.phone,
+            metadata: mergedMetadata,
+            contactListIds: updatedListIds
+          };
+
+          if (reactivateDuplicates && existingContact.optedOut) {
+            updates.optedOut = false;
+            updates.optedOutAt = null;
+          }
+
+          duplicateUpdates.push({contact: existingContact, updates});
         }
-
-        const mergedMetadata = { ...existingContact.metadata, ...contact.metadata };
-
-        const updates = {
-          firstName: contact.firstName || existingContact.firstName,
-          lastName: contact.lastName || existingContact.lastName,
-          email: contact.email || existingContact.email,
-          phone: contact.phone || existingContact.phone,
-          metadata: mergedMetadata,
-          contactListIds: updatedListIds
-        };
-
-        if (reactivateDuplicates && existingContact.optedOut) {
-          updates.optedOut = false;
-          updates.optedOutAt = null;
-        }
-
-        duplicateUpdates.push({contact: existingContact, updates});
       } else {
         // New contact
         newContacts.push({
