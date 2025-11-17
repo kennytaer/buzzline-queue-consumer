@@ -46,6 +46,16 @@ class KVService {
     }
   }
 
+  async deleteCache(key) {
+    this.checkRateLimit();
+    try {
+      this.incrementOperationCount();
+      await this.cache.delete(key);
+    } catch (error) {
+      console.error('KV cache delete error:', error);
+    }
+  }
+
   async get(key) {
     this.checkRateLimit();
     try {
@@ -67,6 +77,17 @@ class KVService {
       console.error('KV main put error:', error);
     }
   }
+
+  async listMain(options = {}) {
+    this.checkRateLimit();
+    try {
+      this.incrementOperationCount();
+      return await this.main.list(options);
+    } catch (error) {
+      console.error('KV main list error:', error);
+      throw error;
+    }
+  }
 }
 
 // Message types for unified queue processing
@@ -75,13 +96,27 @@ const MESSAGE_TYPES = {
   CAMPAIGN_SEND: 'campaign_send',
   CONTACT_DELETE: 'contact_delete',
   OPT_OUT_BATCH: 'opt_out_batch',
-  BULK_DELETE_ORG_DATA: 'bulk_delete_org_data'
+  BULK_DELETE_ORG_DATA: 'bulk_delete_org_data',
+  METADATA_REBUILD: 'metadata_rebuild'
 };
 
 // Contact metadata management
 class ContactMetadataService {
   constructor(kvService) {
     this.kv = kvService;
+  }
+
+  createEmptyMetadata() {
+    return {
+      totalContacts: 0,
+      contactsWithEmail: 0,
+      contactsWithPhone: 0,
+      contactsWithBoth: 0,
+      subscribedContacts: 0,
+      optedOutContacts: 0,
+      lastUpdated: new Date().toISOString(),
+      version: 0
+    };
   }
   
   // Get or initialize contact metadata for an organization
@@ -94,16 +129,8 @@ class ContactMetadataService {
     }
     
     // Initialize metadata if it doesn't exist
-    const initialMetadata = {
-      totalContacts: 0,
-      contactsWithEmail: 0,
-      contactsWithPhone: 0,
-      contactsWithBoth: 0,
-      subscribedContacts: 0,
-      optedOutContacts: 0,
-      lastUpdated: new Date().toISOString(),
-      version: 1
-    };
+    const initialMetadata = this.createEmptyMetadata();
+    initialMetadata.version = 1;
     
     await this.kv.put(metaKey, initialMetadata);
     return initialMetadata;
@@ -230,16 +257,7 @@ class ContactMetadataService {
     console.log('🔄 REBUILDING CONTACT METADATA for org:', orgId);
 
     const prefix = `org:${orgId}:contact:`;
-    const metadata = {
-      totalContacts: 0,
-      contactsWithEmail: 0,
-      contactsWithPhone: 0,
-      contactsWithBoth: 0,
-      subscribedContacts: 0,
-      optedOutContacts: 0,
-      lastUpdated: new Date().toISOString(),
-      version: 1
-    };
+    const metadata = this.createEmptyMetadata();
 
     let cursor = undefined;
     let batchNumber = 0;
@@ -247,7 +265,7 @@ class ContactMetadataService {
     do {
       batchNumber++;
       // Use smaller batch size to avoid rate limits (Workers: 1000 reads/sec limit)
-      const list = await this.kv.main.list({ prefix, limit: 500, cursor });
+      const list = await this.kv.listMain({ prefix, limit: 500, cursor });
 
       console.log(`📊 Metadata rebuild batch ${batchNumber}: ${list.keys.length} contacts`);
 
@@ -259,8 +277,7 @@ class ContactMetadataService {
         const chunk = list.keys.slice(i, i + CHUNK_SIZE);
         const chunkPromises = chunk.map(async (key) => {
           try {
-            const contactData = await this.kv.main.get(key.name);
-            return contactData ? JSON.parse(contactData) : null;
+            return await this.kv.get(key.name);
           } catch (error) {
             console.error('Failed to parse contact:', error);
             return null;
@@ -496,21 +513,21 @@ class ContactService {
       const searchKey = `org:${orgId}:contact_search`;
 
       // Get existing metadata to know how many pages to clear
-      const existingMeta = await this.kv.cache.get(metaKey);
+      const existingMeta = await this.kv.getCache(metaKey);
       if (existingMeta) {
-        const metadata = JSON.parse(existingMeta);
+        const metadata = existingMeta;
         console.log(`🧹 WORKER - Clearing ${metadata.totalPages || 0} cached pages`);
 
         // Clear all cached page indexes
         for (let page = 1; page <= (metadata.totalPages || 0) + 1; page++) {
           const pageKey = `org:${orgId}:contact_index:page_${page}`;
-          await this.kv.cache.delete(pageKey);
+          await this.kv.deleteCache(pageKey);
         }
       }
 
       // Delete metadata and search index
-      await this.kv.cache.delete(metaKey);
-      await this.kv.cache.delete(searchKey);
+      await this.kv.deleteCache(metaKey);
+      await this.kv.deleteCache(searchKey);
 
       console.log('✅ WORKER - Cache invalidated. Dashboard will rebuild on next load.');
 
@@ -519,6 +536,320 @@ class ContactService {
       console.error('❌ WORKER - Cache invalidation failed:', error);
       throw error;
     }
+  }
+}
+
+const METADATA_REBUILD_LIMIT_BUFFER = 75;
+const METADATA_REBUILD_SCAN_LIMIT = 150;
+const METADATA_CACHE_DELETE_BATCH = 25;
+const METADATA_REBUILD_LOCK_TTL_MS = 30000;
+
+const getMetadataRebuildProgressKey = (orgId, jobId) => `org:${orgId}:metadata_rebuild:${jobId}`;
+
+const generateLockId = () => (typeof crypto !== 'undefined' && crypto.randomUUID
+  ? crypto.randomUUID()
+  : `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+
+const shouldYieldForKvBudget = (kvService, buffer = METADATA_REBUILD_LIMIT_BUFFER) =>
+  (kvService.maxOperations - kvService.operationCount) <= buffer;
+
+async function enqueueMetadataRebuild(kvService, params) {
+  const { orgId, reason = 'general', uploadContext = null, finalizationKey = null } = params;
+  let jobId = params.jobId;
+
+  if (finalizationKey) {
+    const finalizationState = await kvService.getCache(finalizationKey);
+    if (finalizationState?.status === 'queued') {
+      console.log('⚠️ METADATA REBUILD already queued:', { orgId, jobId: finalizationState.jobId, reason });
+      return finalizationState.jobId;
+    }
+    if (finalizationState?.status === 'completed') {
+      console.log('ℹ️ METADATA REBUILD already completed for finalization key', { orgId, reason });
+      return finalizationState.jobId;
+    }
+  }
+
+  jobId = jobId || `${reason}:${Date.now()}`;
+  const progressKey = getMetadataRebuildProgressKey(orgId, jobId);
+  const existingProgress = await kvService.getCache(progressKey);
+
+  if (existingProgress && existingProgress.stage && existingProgress.stage !== 'completed') {
+    console.log('⚠️ METADATA REBUILD already in progress:', { orgId, jobId: existingProgress.jobId, reason });
+    return existingProgress.jobId;
+  }
+
+  if (existingProgress?.stage === 'completed') {
+    console.log('ℹ️ METADATA REBUILD already completed for job', { orgId, jobId });
+    return existingProgress.jobId;
+  }
+
+  const progressRecord = {
+    orgId,
+    jobId,
+    stage: 'pending',
+    reason,
+    uploadContext,
+    finalizationKey,
+    startedAt: new Date().toISOString()
+  };
+
+  await kvService.setCache(progressKey, progressRecord, 7200);
+
+  if (finalizationKey) {
+    await kvService.setCache(finalizationKey, {
+      status: 'queued',
+      jobId,
+      reason,
+      updatedAt: new Date().toISOString()
+    }, 7200);
+  }
+
+  await kvService.env.CONTACT_PROCESSING_QUEUE.send({
+    type: MESSAGE_TYPES.METADATA_REBUILD,
+    orgId,
+    jobId,
+    reason,
+    uploadContext,
+    finalizationKey
+  });
+
+  console.log('✅ METADATA REBUILD JOB QUEUED:', { orgId, jobId, reason });
+  return jobId;
+}
+
+async function requeueMetadataRebuildJob(kvService, progressKey, progress, lockId) {
+  if (progress.lockId === lockId) {
+    delete progress.lockId;
+    delete progress.lockedAt;
+  }
+
+  await kvService.setCache(progressKey, progress, 7200);
+
+  await kvService.env.CONTACT_PROCESSING_QUEUE.send({
+    type: MESSAGE_TYPES.METADATA_REBUILD,
+    orgId: progress.orgId,
+    jobId: progress.jobId,
+    reason: progress.reason,
+    uploadContext: progress.uploadContext,
+    finalizationKey: progress.finalizationKey
+  });
+
+  console.log('🔁 METADATA REBUILD re-queued due to KV budget:', {
+    orgId: progress.orgId,
+    jobId: progress.jobId,
+    stage: progress.stage,
+    processedContacts: progress.processedContacts || 0
+  });
+}
+
+async function markFinalizationComplete(kvService, finalizationKey, jobId) {
+  if (!finalizationKey) return;
+
+  await kvService.setCache(finalizationKey, {
+    status: 'completed',
+    jobId,
+    completedAt: new Date().toISOString()
+  }, 3600);
+}
+
+async function processMetadataRebuildJob(message, kvService) {
+  const {
+    orgId,
+    jobId = `metadata:${Date.now()}`,
+    reason = 'general',
+    uploadContext = null,
+    finalizationKey = null
+  } = message;
+
+  const metadataService = new ContactMetadataService(kvService);
+  const progressKey = getMetadataRebuildProgressKey(orgId, jobId);
+  let progress = await kvService.getCache(progressKey);
+
+  if (progress && progress.stage === 'completed') {
+    console.log('ℹ️ METADATA REBUILD already completed - skipping duplicate message', { orgId, jobId });
+    await markFinalizationComplete(kvService, progress.finalizationKey || finalizationKey, jobId);
+    return;
+  }
+
+  if (!progress) {
+    progress = {
+      orgId,
+      jobId,
+      stage: 'metadata',
+      reason,
+      metadata: metadataService.createEmptyMetadata(),
+      cursor: undefined,
+      processedContacts: 0,
+      batchNumber: 0,
+      uploadContext,
+      finalizationKey,
+      startedAt: new Date().toISOString()
+    };
+  } else {
+    progress.stage = progress.stage && progress.stage !== 'pending' ? progress.stage : 'metadata';
+    progress.metadata = progress.metadata || metadataService.createEmptyMetadata();
+    progress.reason = progress.reason || reason;
+    progress.uploadContext = progress.uploadContext || uploadContext || null;
+    progress.finalizationKey = progress.finalizationKey || finalizationKey || null;
+    progress.orgId = orgId;
+    progress.jobId = jobId;
+  }
+
+  const existingLockAge = progress.lockedAt ? (Date.now() - new Date(progress.lockedAt).getTime()) : Infinity;
+  if (progress.lockId && existingLockAge < METADATA_REBUILD_LOCK_TTL_MS) {
+    console.log('⏳ METADATA REBUILD already locked by another worker', { orgId, jobId });
+    return;
+  }
+
+  const lockId = generateLockId();
+  progress.lockId = lockId;
+  progress.lockedAt = new Date().toISOString();
+  await kvService.setCache(progressKey, progress, 7200);
+
+  progress = await kvService.getCache(progressKey);
+  if (!progress || progress.lockId !== lockId) {
+    console.log('⚠️ METADATA REBUILD lock contention - deferring execution', { orgId, jobId });
+    return;
+  }
+
+  progress.metadata = progress.metadata || metadataService.createEmptyMetadata();
+
+  const prefix = `org:${orgId}:contact:`;
+
+  if (progress.stage === 'metadata') {
+    while (true) {
+      const listOptions = { prefix, limit: METADATA_REBUILD_SCAN_LIMIT };
+      if (progress.cursor) {
+        listOptions.cursor = progress.cursor;
+      }
+
+      const list = await kvService.listMain(listOptions);
+      progress.batchNumber = (progress.batchNumber || 0) + 1;
+      console.log(`📊 METADATA REBUILD JOB ${jobId} - Batch ${progress.batchNumber}: ${list.keys.length} contacts`);
+
+      for (const key of list.keys) {
+        const contact = await kvService.get(key.name);
+        if (contact) {
+          metadataService.applyAddOperation(progress.metadata, contact);
+        }
+      }
+
+      progress.processedContacts = (progress.processedContacts || 0) + list.keys.length;
+      progress.cursor = list.list_complete ? undefined : list.cursor;
+      await kvService.setCache(progressKey, progress, 7200);
+
+      if (list.list_complete) {
+        break;
+      }
+
+      if (shouldYieldForKvBudget(kvService)) {
+        await requeueMetadataRebuildJob(kvService, progressKey, progress, lockId);
+        return;
+      }
+    }
+
+    progress.metadata.lastUpdated = new Date().toISOString();
+    progress.metadata.version = (progress.metadata.version || 0) + 1;
+    await kvService.put(`org:${orgId}:contact_metadata`, progress.metadata);
+
+    progress.stage = 'cache_invalidation';
+    progress.cursor = undefined;
+    progress.cacheInvalidation = progress.cacheInvalidation || {
+      totalPages: 0,
+      nextPage: 1,
+      clearedMeta: false,
+      clearedSearch: false
+    };
+
+    const cachedMeta = await kvService.getCache(`org:${orgId}:contact_meta`);
+    progress.cacheInvalidation.totalPages = cachedMeta?.totalPages || 0;
+    await kvService.setCache(progressKey, progress, 7200);
+  }
+
+  if (progress.stage === 'cache_invalidation') {
+    const cacheState = progress.cacheInvalidation || {
+      totalPages: 0,
+      nextPage: 1,
+      clearedMeta: false,
+      clearedSearch: false
+    };
+
+    while (cacheState.nextPage <= (cacheState.totalPages || 0) + 1) {
+      const pageKey = `org:${orgId}:contact_index:page_${cacheState.nextPage}`;
+      await kvService.deleteCache(pageKey);
+      cacheState.nextPage++;
+
+      if ((cacheState.nextPage - 1) % METADATA_CACHE_DELETE_BATCH === 0 && shouldYieldForKvBudget(kvService)) {
+        progress.cacheInvalidation = cacheState;
+        await requeueMetadataRebuildJob(kvService, progressKey, progress, lockId);
+        return;
+      }
+    }
+
+    const metaKey = `org:${orgId}:contact_meta`;
+    const searchKey = `org:${orgId}:contact_search`;
+
+    if (!cacheState.clearedMeta) {
+      await kvService.deleteCache(metaKey);
+      cacheState.clearedMeta = true;
+      if (shouldYieldForKvBudget(kvService)) {
+        progress.cacheInvalidation = cacheState;
+        await requeueMetadataRebuildJob(kvService, progressKey, progress, lockId);
+        return;
+      }
+    }
+
+    if (!cacheState.clearedSearch) {
+      await kvService.deleteCache(searchKey);
+      cacheState.clearedSearch = true;
+      if (shouldYieldForKvBudget(kvService)) {
+        progress.cacheInvalidation = cacheState;
+        await requeueMetadataRebuildJob(kvService, progressKey, progress, lockId);
+        return;
+      }
+    }
+
+    progress.cacheInvalidation = cacheState;
+    progress.stage = 'completed';
+    progress.completedAt = new Date().toISOString();
+  }
+
+  if (progress.stage === 'completed') {
+    if (progress.lockId === lockId) {
+      delete progress.lockId;
+      delete progress.lockedAt;
+    }
+
+    await kvService.setCache(progressKey, progress, 7200);
+
+    if (progress.uploadContext?.uploadId) {
+      const { uploadId, listId, totalResults } = progress.uploadContext;
+      const uploadKey = `org:${orgId}:upload_status:${uploadId}`;
+      await kvService.setCache(uploadKey, {
+        status: 'complete',
+        stage: 'complete',
+        processed: totalResults.contacts,
+        total: totalResults.contacts,
+        results: {
+          listId,
+          totalRows: totalResults.contacts,
+          successfulRows: totalResults.created,
+          duplicatesUpdated: totalResults.duplicatesUpdated,
+          skippedDuplicates: totalResults.skippedDuplicates,
+          failedRows: totalResults.errors,
+          errors: []
+        },
+        completedAt: new Date().toISOString()
+      }, 7200);
+    }
+
+    await markFinalizationComplete(kvService, progress.finalizationKey, jobId);
+    console.log('✅ METADATA REBUILD JOB COMPLETE:', {
+      orgId,
+      jobId,
+      processedContacts: progress.processedContacts || 0,
+      reason: progress.reason
+    });
   }
 }
 
@@ -854,7 +1185,7 @@ async function processOptOutBatch(message, kvService) {
     });
 
     // Check if all batches are complete and finalize
-    await checkAndFinalizeOptOutBatches(kvService, contactService, orgId, totalBatches);
+    await checkAndFinalizeOptOutBatches(kvService, orgId, totalBatches);
 
   } catch (error) {
     console.error(`❌ OPT-OUT BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
@@ -863,7 +1194,7 @@ async function processOptOutBatch(message, kvService) {
 }
 
 // Check and finalize opt-out batches
-async function checkAndFinalizeOptOutBatches(kvService, contactService, orgId, totalBatches) {
+async function checkAndFinalizeOptOutBatches(kvService, orgId, totalBatches) {
   try {
     // Check if all batches are completed
     const completedBatches = [];
@@ -880,24 +1211,14 @@ async function checkAndFinalizeOptOutBatches(kvService, contactService, orgId, t
     if (completedBatches.length === totalBatches) {
       console.log('🎉 ALL OPT-OUT BATCHES COMPLETED - Starting finalization');
 
-      // Rebuild metadata to ensure accurate counts (fixes race condition)
-      console.log('🔄 OPT-OUT FINALIZATION - Rebuilding contact metadata...');
-      try {
-        await contactService.metadataService.rebuildContactMetadata(orgId);
-        console.log('✅ OPT-OUT FINALIZATION - Contact metadata rebuilt successfully');
-      } catch (metadataError) {
-        console.error('❌ OPT-OUT FINALIZATION - Failed to rebuild metadata:', metadataError);
-      }
+      const finalizationKey = `org:${orgId}:opt_out_finalization`;
+      const jobId = await enqueueMetadataRebuild(kvService, {
+        orgId,
+        reason: 'opt_out',
+        finalizationKey
+      });
 
-      // Invalidate dashboard cache
-      try {
-        await contactService.forceRebuildMetadata(orgId);
-        console.log('✅ OPT-OUT FINALIZATION - Dashboard cache invalidated');
-      } catch (cacheError) {
-        console.error('❌ OPT-OUT FINALIZATION - Failed to invalidate cache:', cacheError);
-      }
-
-      console.log('✅ OPT-OUT FINALIZATION COMPLETE');
+      console.log('✅ OPT-OUT FINALIZATION - Metadata rebuild queued', { orgId, jobId });
     }
   } catch (error) {
     console.error('❌ OPT-OUT FINALIZATION FAILED:', error);
@@ -955,8 +1276,7 @@ async function processContactDeletion(message, kvService) {
     });
 
     // Check if all batches are complete and finalize
-    const contactService = new ContactService(kvService.env);
-    await checkAndFinalizeContactDeletion(kvService, contactService, orgId, totalBatches);
+    await checkAndFinalizeContactDeletion(kvService, orgId, totalBatches);
 
   } catch (error) {
     console.error(`❌ DELETE BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
@@ -965,7 +1285,7 @@ async function processContactDeletion(message, kvService) {
 }
 
 // Check and finalize contact deletion batches
-async function checkAndFinalizeContactDeletion(kvService, contactService, orgId, totalBatches) {
+async function checkAndFinalizeContactDeletion(kvService, orgId, totalBatches) {
   try {
     // Check if all batches are completed
     const completedBatches = [];
@@ -982,24 +1302,14 @@ async function checkAndFinalizeContactDeletion(kvService, contactService, orgId,
     if (completedBatches.length === totalBatches) {
       console.log('🎉 ALL DELETION BATCHES COMPLETED - Starting finalization');
 
-      // Rebuild metadata to ensure accurate counts (fixes race condition)
-      console.log('🔄 DELETION FINALIZATION - Rebuilding contact metadata...');
-      try {
-        await contactService.metadataService.rebuildContactMetadata(orgId);
-        console.log('✅ DELETION FINALIZATION - Contact metadata rebuilt successfully');
-      } catch (metadataError) {
-        console.error('❌ DELETION FINALIZATION - Failed to rebuild metadata:', metadataError);
-      }
+      const finalizationKey = `org:${orgId}:deletion_finalization`;
+      const jobId = await enqueueMetadataRebuild(kvService, {
+        orgId,
+        reason: 'contact_deletion',
+        finalizationKey
+      });
 
-      // Invalidate dashboard cache
-      try {
-        await contactService.forceRebuildMetadata(orgId);
-        console.log('✅ DELETION FINALIZATION - Dashboard cache invalidated');
-      } catch (cacheError) {
-        console.error('❌ DELETION FINALIZATION - Failed to invalidate cache:', cacheError);
-      }
-
-      console.log('✅ DELETION FINALIZATION COMPLETE');
+      console.log('✅ DELETION FINALIZATION - Metadata rebuild queued', { orgId, jobId });
     }
   } catch (error) {
     console.error('❌ DELETION FINALIZATION FAILED:', error);
@@ -1093,27 +1403,17 @@ async function processBulkDeleteOrgData(message, kvService) {
 
     // Check if all prefixes are processed
     if (progress.processedPrefixes.length === prefixesToDelete.length) {
-      // All prefixes complete - rebuild metadata and clean up progress
-      console.log('🔄 BULK DELETE FINALIZATION - Rebuilding contact metadata...');
-      try {
-        await contactService.metadataService.rebuildContactMetadata(orgId);
-        console.log('✅ BULK DELETE FINALIZATION - Contact metadata rebuilt successfully');
-      } catch (metadataError) {
-        console.error('❌ BULK DELETE FINALIZATION - Failed to rebuild metadata:', metadataError);
-      }
+      const finalizationKey = `org:${orgId}:bulk_delete_finalization:${deletionId}`;
+      const jobId = await enqueueMetadataRebuild(kvService, {
+        orgId,
+        jobId: `bulk_delete:${deletionId}`,
+        reason: 'bulk_delete',
+        finalizationKey
+      });
 
-      // Invalidate dashboard cache
-      try {
-        await contactService.forceRebuildMetadata(orgId);
-        console.log('✅ BULK DELETE FINALIZATION - Dashboard cache invalidated');
-      } catch (cacheError) {
-        console.error('❌ BULK DELETE FINALIZATION - Failed to invalidate cache:', cacheError);
-      }
+      await kvService.deleteCache(progressKey);
 
-      // Delete progress tracker
-      await kvService.cache.delete(progressKey);
-
-      console.log(`✅ BULK DELETE ORG DATA COMPLETE - Deleted ${progress.totalDeleted} keys for org: ${orgId}`);
+      console.log(`✅ BULK DELETE ORG DATA COMPLETE - Deleted ${progress.totalDeleted} keys for org: ${orgId}. Metadata job queued: ${jobId}`);
     } else if (needsContinuation) {
       // Queue a new message to continue deletion (avoid retry limits)
       console.log(`🔄 BULK DELETE - Queueing continuation message (${progress.processedPrefixes.length}/${prefixesToDelete.length} prefixes complete)`);
@@ -1184,9 +1484,8 @@ async function processContactBatch(message, kvService) {
       const existingContactPromises = duplicateContactIds.map(async (contactId) => {
         try {
           const contactKey = `org:${orgId}:contact:${contactId}`;
-          const contactData = await contactService.kv.get(contactKey);
-          if (contactData) {
-            const contact = JSON.parse(contactData);
+          const contact = await contactService.kv.get(contactKey);
+          if (contact) {
             return { id: contactId, contact };
           }
         } catch (error) {
@@ -1336,7 +1635,7 @@ async function processContactBatch(message, kvService) {
     // Metadata will be rebuilt from scratch after all batches complete in finalization
 
     // Check if this was the last batch and trigger final processing
-    await checkAndFinalizeBatch(kvService, contactService, orgId, uploadId, listId, totalBatches);
+    await checkAndFinalizeBatch(kvService, orgId, uploadId, listId, totalBatches);
     
   } catch (error) {
     console.error(`❌ WORKER BATCH ${batchNumber}/${totalBatches} - Failed:`, error);
@@ -1371,7 +1670,7 @@ async function updateBatchStatus(kvService, orgId, uploadId, batchNumber, status
   await kvService.setCache(batchKey, batchStatus, 7200);
 }
 
-async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId, listId, totalBatches) {
+async function checkAndFinalizeBatch(kvService, orgId, uploadId, listId, totalBatches) {
   try {
     // Check if all batches are completed
     const completedBatches = [];
@@ -1397,31 +1696,10 @@ async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId,
         contacts: acc.contacts + (batch.contacts || 0)
       }), { created: 0, duplicatesUpdated: 0, skippedDuplicates: 0, errors: 0, contacts: 0 });
 
-      // CRITICAL FIX: Rebuild contact metadata to fix race condition in incremental updates
-      // Incremental updates from parallel batches suffer from read-modify-write race conditions
-      // This ensures accurate counts by scanning all contacts (now with rate limiting)
-      console.log('🔄 WORKER FINALIZATION - Rebuilding contact metadata for accurate counts...');
-      try {
-        await contactService.metadataService.rebuildContactMetadata(orgId);
-        console.log('✅ WORKER FINALIZATION - Contact metadata rebuilt successfully');
-      } catch (metadataError) {
-        console.error('❌ WORKER FINALIZATION - Failed to rebuild metadata:', metadataError);
-        // Don't fail the entire upload for metadata rebuild issues
-      }
-
-      // Invalidate dashboard cache so it rebuilds with fresh data
-      try {
-        await contactService.forceRebuildMetadata(orgId);
-        console.log('✅ WORKER FINALIZATION - Dashboard cache invalidated');
-      } catch (cacheError) {
-        console.error('❌ WORKER FINALIZATION - Failed to invalidate cache:', cacheError);
-      }
-
-      // Update final upload status
       const uploadKey = `org:${orgId}:upload_status:${uploadId}`;
       await kvService.setCache(uploadKey, {
-        status: 'complete',
-        stage: 'complete',
+        status: 'finalizing',
+        stage: 'metadata_rebuild',
         processed: totalResults.contacts,
         total: totalResults.contacts,
         results: {
@@ -1433,10 +1711,23 @@ async function checkAndFinalizeBatch(kvService, contactService, orgId, uploadId,
           failedRows: totalResults.errors,
           errors: []
         },
-        completedAt: new Date().toISOString()
+        updatedAt: new Date().toISOString()
       }, 7200);
 
-      console.log('✅ WORKER FINALIZATION COMPLETE - Upload finished:', totalResults);
+      const finalizationKey = `org:${orgId}:upload_finalization:${uploadId}`;
+      const jobId = await enqueueMetadataRebuild(kvService, {
+        orgId,
+        jobId: `upload:${uploadId}`,
+        reason: 'contact_upload',
+        uploadContext: {
+          uploadId,
+          listId,
+          totalResults
+        },
+        finalizationKey
+      });
+
+      console.log('✅ WORKER FINALIZATION - Metadata rebuild queued', { orgId, jobId, uploadId });
     }
   } catch (error) {
     console.error('❌ WORKER FINALIZATION FAILED:', error);
@@ -1486,6 +1777,9 @@ export default {
         case MESSAGE_TYPES.BULK_DELETE_ORG_DATA:
           // Bulk delete will enumerate keys dynamically, estimate conservatively
           estimatedOps = 500;
+          break;
+        case MESSAGE_TYPES.METADATA_REBUILD:
+          estimatedOps = 900; // Force sequential processing
           break;
         default:
           estimatedOps = 100;
@@ -1547,6 +1841,9 @@ export default {
                 break;
               case MESSAGE_TYPES.BULK_DELETE_ORG_DATA:
                 await processBulkDeleteOrgData(message.body, kvService);
+                break;
+              case MESSAGE_TYPES.METADATA_REBUILD:
+                await processMetadataRebuildJob(message.body, kvService);
                 break;
               default:
                 throw new Error(`Unknown message type: ${message.body.type}`);
@@ -1637,6 +1934,9 @@ export default {
               break;
             case MESSAGE_TYPES.BULK_DELETE_ORG_DATA:
               await processBulkDeleteOrgData(message.body, kvService);
+              break;
+            case MESSAGE_TYPES.METADATA_REBUILD:
+              await processMetadataRebuildJob(message.body, kvService);
               break;
             default:
               throw new Error(`Unknown message type: ${message.body.type}`);
