@@ -111,6 +111,13 @@ const MESSAGE_TYPES = {
   METADATA_REBUILD: 'metadata_rebuild'
 };
 
+// Mailgun public docs cap default sending to roughly 300 requests per minute per domain.
+// https://documentation.mailgun.com/en/latest/user_manual.html#per-domain-rate-limits
+const CAMPAIGN_SEND_BATCH_SIZE = 25;
+const CAMPAIGN_BATCH_DELAY_MS = 500;
+const MAILGUN_MAX_EMAILS_PER_MINUTE = 300;
+const MAILGUN_RATE_LIMIT_WINDOW_MS = 60_000;
+
 // Contact metadata management
 class ContactMetadataService {
   constructor(kvService) {
@@ -706,6 +713,15 @@ async function processMetadataRebuildJob(message, kvService) {
     progress.jobId = jobId;
   }
 
+
+  const targetListId = progress.uploadContext?.listId || uploadContext?.listId || null;
+  if (targetListId) {
+    progress.listAssignment = progress.listAssignment || { listId: targetListId, contactIds: [] };
+    if (!progress.listAssignment.listId) {
+      progress.listAssignment.listId = targetListId;
+    }
+  }
+
   const existingLockAge = progress.lockedAt ? (Date.now() - new Date(progress.lockedAt).getTime()) : Infinity;
   if (progress.lockId && existingLockAge < METADATA_REBUILD_LOCK_TTL_MS) {
     console.log('⏳ METADATA REBUILD already locked by another worker', { orgId, jobId });
@@ -725,6 +741,9 @@ async function processMetadataRebuildJob(message, kvService) {
 
   progress.metadata = progress.metadata || metadataService.createEmptyMetadata();
 
+  const listAssignment = progress.listAssignment || null;
+  const listAssignmentSet = listAssignment ? new Set(listAssignment.contactIds || []) : null;
+
   const prefix = `org:${orgId}:contact:`;
 
   if (progress.stage === 'metadata') {
@@ -742,6 +761,13 @@ async function processMetadataRebuildJob(message, kvService) {
         const contact = await kvService.get(key.name);
         if (contact) {
           metadataService.applyAddOperation(progress.metadata, contact);
+
+          if (listAssignment && Array.isArray(contact.contactListIds) && contact.contactListIds.includes(listAssignment.listId)) {
+            if (!listAssignmentSet.has(contact.id)) {
+              listAssignmentSet.add(contact.id);
+              listAssignment.contactIds.push(contact.id);
+            }
+          }
         }
       }
 
@@ -854,6 +880,10 @@ async function processMetadataRebuildJob(message, kvService) {
       }, 7200);
     }
 
+    if (progress.listAssignment?.listId) {
+      await assignContactsToList(kvService, orgId, progress.listAssignment.listId, progress.listAssignment.contactIds || []);
+    }
+
     await markFinalizationComplete(kvService, progress.finalizationKey, jobId);
     console.log('✅ METADATA REBUILD JOB COMPLETE:', {
       orgId,
@@ -880,8 +910,8 @@ async function processCampaignBatch(message, kvService) {
       errors: []
     };
     
-    // Process contacts in smaller batches to avoid overwhelming external APIs
-    const SEND_BATCH_SIZE = 5; // Very conservative for API limits
+    // Process contacts in smaller batches to avoid overwhelming external APIs (tunable)
+    const SEND_BATCH_SIZE = CAMPAIGN_SEND_BATCH_SIZE;
     
     for (let i = 0; i < contacts.length; i += SEND_BATCH_SIZE) {
       const batch = contacts.slice(i, i + SEND_BATCH_SIZE);
@@ -906,7 +936,7 @@ async function processCampaignBatch(message, kvService) {
           if ((campaign.type === 'email' || campaign.type === 'both') && 
               campaign.emailTemplate && contact.email) {
             sendPromises.push(
-              sendEmail(contact, campaign, salesMember, messagingEndpoints.email)
+              sendEmailWithRateLimit(kvService, orgId, contact, campaign, salesMember, messagingEndpoints.email)
             );
           }
           
@@ -956,7 +986,7 @@ async function processCampaignBatch(message, kvService) {
       
       // Delay between send batches to respect API limits
       if (i + SEND_BATCH_SIZE < contacts.length) {
-        await new Promise(resolve => setTimeout(resolve, 2000)); // 2 second delay
+        await new Promise(resolve => setTimeout(resolve, CAMPAIGN_BATCH_DELAY_MS));
       }
     }
     
@@ -983,6 +1013,53 @@ async function processCampaignBatch(message, kvService) {
     
     throw error;
   }
+}
+
+async function sendEmailWithRateLimit(kvService, orgId, contact, campaign, salesMember, emailEndpoint) {
+  await waitForMailgunCapacity(kvService, orgId, 1);
+  await sendEmail(contact, campaign, salesMember, emailEndpoint);
+}
+
+async function waitForMailgunCapacity(kvService, orgId, requestedCount = 1) {
+  if (!requestedCount || requestedCount <= 0) {
+    return;
+  }
+
+  const key = getMailgunRateLimitKey(orgId);
+
+  while (true) {
+    const now = Date.now();
+    let record = await kvService.getCache(key);
+
+    if (!record || !record.windowStart || (now - record.windowStart) >= MAILGUN_RATE_LIMIT_WINDOW_MS) {
+      record = { windowStart: now, count: 0 };
+    }
+
+    if ((record.count || 0) + requestedCount <= MAILGUN_MAX_EMAILS_PER_MINUTE) {
+      record.count = (record.count || 0) + requestedCount;
+      record.windowStart = record.windowStart || now;
+      await kvService.setCache(key, record, Math.ceil(MAILGUN_RATE_LIMIT_WINDOW_MS / 1000) * 2);
+      return;
+    }
+
+    const waitMs = Math.max(
+      200,
+      MAILGUN_RATE_LIMIT_WINDOW_MS - (now - record.windowStart) + 50
+    );
+
+    console.log('MAILGUN RATE LIMIT - pausing campaign send', {
+      orgId,
+      requestedCount,
+      currentCount: record.count,
+      waitMs
+    });
+
+    await new Promise(resolve => setTimeout(resolve, Math.min(waitMs, 2000)));
+  }
+}
+
+function getMailgunRateLimitKey(orgId) {
+  return `org:${orgId}:mailgun_rate_limit`;
 }
 
 // Helper functions for campaign sending
@@ -1554,8 +1631,11 @@ async function processContactBatch(message, kvService) {
     // Separate new contacts from duplicates based on pre-computed flags
     const newContacts = [];
     const duplicateUpdates = [];
+    const assignedContactIds = [];
 
-    for (const {rowIndex, contact, contactId, isDuplicate, existingContactId} of contacts) {
+    for (const {rowIndex, contact, contactId, isDuplicate, existingContactId, finalContactId} of contacts) {
+      const resolvedFinalContactId = finalContactId || existingContactId || contactId;
+
       if (isDuplicate && existingContactId) {
         const existingContact = existingContactMap.get(existingContactId);
 
@@ -1582,7 +1662,7 @@ async function processContactBatch(message, kvService) {
             updates.optedOutAt = null;
           }
 
-          duplicateUpdates.push({contact: existingContact, updates});
+          duplicateUpdates.push({contact: existingContact, updates, finalContactId: resolvedFinalContactId || existingContact.id});
         }
       } else {
         // New contact
@@ -1604,6 +1684,7 @@ async function processContactBatch(message, kvService) {
       const bulkResults = await contactService.createContactsBulk(orgId, newContacts);
       results.created.push(...bulkResults.created);
       results.errors.push(...bulkResults.errors);
+      assignedContactIds.push(...bulkResults.created);
     }
     
     // Process duplicate updates in parallel batches
@@ -1615,7 +1696,7 @@ async function processContactBatch(message, kvService) {
     for (let i = 0; i < duplicateUpdates.length; i += DUPLICATE_BATCH_SIZE) {
       const batch = duplicateUpdates.slice(i, i + DUPLICATE_BATCH_SIZE);
       
-      const updatePromises = batch.map(async ({contact, updates}) => {
+      const updatePromises = batch.map(async ({contact, updates, finalContactId}) => {
         try {
           const result = await contactService.updateContact(orgId, contact.id, updates);
           // If result is null, contact wasn't found after retries (race condition)
@@ -1625,7 +1706,8 @@ async function processContactBatch(message, kvService) {
           }
           return {
             success: true,
-            reactivated: reactivateDuplicates && contact.optedOut
+            reactivated: reactivateDuplicates && contact.optedOut,
+            finalContactId: finalContactId || contact.id
           };
         } catch (error) {
           console.error(`Failed to update duplicate contact ${contact.id}:`, error);
@@ -1641,6 +1723,9 @@ async function processContactBatch(message, kvService) {
       batchResults.forEach(result => {
         if (result.status === 'fulfilled') {
           if (result.value.success) {
+            if (!result.value.skipped && result.value.finalContactId) {
+              assignedContactIds.push(result.value.finalContactId);
+            }
             if (result.value.skipped) {
               // Contact wasn't found (race condition) - don't count as error
               skippedDuplicates++;
@@ -1658,9 +1743,11 @@ async function processContactBatch(message, kvService) {
       });
     }
     
+    const uniqueAssignedContactIds = Array.from(new Set(assignedContactIds));
     // ALWAYS write completion status so finalization can track progress accurately
     await updateBatchStatus(kvService, orgId, uploadId, batchNumber, 'completed', {
       contacts: contacts.length,
+      contactIds: uniqueAssignedContactIds,
       created: results.created.length,
       duplicatesUpdated,
       skippedDuplicates,
@@ -1716,6 +1803,45 @@ async function updateBatchStatus(kvService, orgId, uploadId, batchNumber, status
   await kvService.setCache(batchKey, batchStatus, 7200);
 }
 
+function normalizeContactIdsForList(contactIds = []) {
+  const uniqueIds = new Set();
+  for (const id of contactIds || []) {
+    if (typeof id !== 'string') {
+      continue;
+    }
+    const trimmed = id.trim();
+    if (trimmed) {
+      uniqueIds.add(trimmed);
+    }
+  }
+  return Array.from(uniqueIds);
+}
+
+async function assignContactsToList(kvService, orgId, listId, contactIds = []) {
+  if (!orgId || !listId) {
+    return null;
+  }
+
+  const normalizedIds = normalizeContactIdsForList(contactIds);
+  const listKey = `org:${orgId}:contactlist:${listId}`;
+  const existingList = await kvService.get(listKey);
+
+  if (!existingList) {
+    console.warn('CONTACT LIST ASSIGNMENT - Contact list not found', { orgId, listId, totalContacts: normalizedIds.length });
+    return null;
+  }
+
+  const updatedList = {
+    ...existingList,
+    contactIds: normalizedIds,
+    contactCount: normalizedIds.length,
+    updatedAt: new Date().toISOString()
+  };
+
+  await kvService.put(listKey, updatedList);
+  return updatedList;
+}
+
 async function checkAndFinalizeBatch(kvService, orgId, uploadId, listId, totalBatches) {
   try {
     // Check if all batches are completed
@@ -1741,6 +1867,16 @@ async function checkAndFinalizeBatch(kvService, orgId, uploadId, listId, totalBa
         errors: acc.errors + (batch.errors || 0),
         contacts: acc.contacts + (batch.contacts || 0)
       }), { created: 0, duplicatesUpdated: 0, skippedDuplicates: 0, errors: 0, contacts: 0 });
+
+      const aggregatedContactIds = normalizeContactIdsForList(
+        completedBatches.flatMap(batch => batch.contactIds || [])
+      );
+
+      if (aggregatedContactIds.length > 0) {
+        await assignContactsToList(kvService, orgId, listId, aggregatedContactIds);
+      } else {
+        console.warn('CONTACT LIST ASSIGNMENT - No contact IDs found during finalization', { orgId, listId, uploadId });
+      }
 
       const uploadKey = `org:${orgId}:upload_status:${uploadId}`;
       await kvService.setCache(uploadKey, {
