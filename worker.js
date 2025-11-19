@@ -1889,6 +1889,13 @@ async function processSegmentBuildJob(message, kvService) {
 
         if (matchingInChunk.length > 0) {
           await kvService.setCache(`${matchesKeyPrefix}:${chunkIndex}`, matchingInChunk.map(contact => contact.id), 7200);
+          console.log('SEGMENT BUILD - chunk processed', {
+            segmentId,
+            chunkIndex,
+            chunkSize: contacts.length,
+            chunkMatches: matchingInChunk.length,
+            hasMore: !list.list_complete
+          });
           chunkIndex++;
         }
 
@@ -1905,6 +1912,11 @@ async function processSegmentBuildJob(message, kvService) {
         }, 7200);
 
         if (cursor && kvService.operationCount >= MAX_SAFE_OPS) {
+          console.warn('SEGMENT BUILD - rate limited during scan, requeueing', {
+            segmentId,
+            chunkIndex,
+            operations: kvService.operationCount
+          });
           await kvService.setCache(statusKey, {
             status: 'queued',
             stage: 'rate_limited',
@@ -1919,6 +1931,11 @@ async function processSegmentBuildJob(message, kvService) {
         }
       } catch (chunkError) {
         if (chunkError instanceof Error && chunkError.message.includes('KV rate limit')) {
+          console.warn('SEGMENT BUILD - KV limit hit during scan, requeueing', {
+            segmentId,
+            chunkIndex,
+            operations: kvService.operationCount
+          });
           await kvService.setCache(statusKey, {
             status: 'queued',
             stage: 'rate_limited',
@@ -1938,6 +1955,11 @@ async function processSegmentBuildJob(message, kvService) {
 
     const matchingContactIds = await collectSegmentMatches(kvService, matchesKeyPrefix, chunkIndex);
     const uniqueIds = Array.from(new Set(matchingContactIds));
+    console.log('SEGMENT BUILD - scan complete', {
+      segmentId,
+      totalMatches: uniqueIds.length,
+      chunksWithMatches: chunkIndex
+    });
 
     const previousContactIds = existingSegment.contactIds || [];
     const toAdd = uniqueIds.filter(id => !previousContactIds.includes(id));
@@ -2055,6 +2077,12 @@ async function processSegmentUpdatePhase(message, kvService) {
     }, 7200);
 
     if (updateState.removeOffset < removeIds.length || kvService.operationCount >= MAX_SAFE_OPS) {
+      console.log('SEGMENT BUILD - removing contacts progress', {
+        segmentId,
+        removed: updateState.removeOffset,
+        totalToRemove: removeIds.length,
+        operations: kvService.operationCount
+      });
       await enqueueSegmentContinuation({ ...message, phase: 'update_contacts' }, kvService, null, message.chunkIndex || 0);
       return;
     }
@@ -2077,6 +2105,12 @@ async function processSegmentUpdatePhase(message, kvService) {
     }, 7200);
 
     if (updateState.addOffset < addIds.length || kvService.operationCount >= MAX_SAFE_OPS) {
+      console.log('SEGMENT BUILD - adding contacts progress', {
+        segmentId,
+        added: updateState.addOffset,
+        totalToAdd: addIds.length,
+        operations: kvService.operationCount
+      });
       await enqueueSegmentContinuation({ ...message, phase: 'update_contacts' }, kvService, null, message.chunkIndex || 0);
       return;
     }
@@ -2099,6 +2133,11 @@ async function processSegmentUpdatePhase(message, kvService) {
     matchedContacts: finalIds.length,
     completedAt: new Date().toISOString()
   }, 7200);
+
+  console.log('SEGMENT BUILD - update complete', {
+    segmentId,
+    finalContacts: finalIds.length
+  });
 
   await kvService.deleteCache(`${matchesKeyPrefix}:final`);
   await kvService.deleteCache(`${matchesKeyPrefix}:add`);
