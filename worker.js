@@ -1871,9 +1871,10 @@ async function processSegmentBuildJob(message, kvService) {
     let chunkIndex = resumeChunkIndex;
     const contactMap = new Map();
 
+    const CHUNK_LIMIT = 100;
     do {
       try {
-        const list = await kvService.listMain({ prefix: `org:${orgId}:contact:`, limit: 200, cursor });
+        const list = await kvService.listMain({ prefix: `org:${orgId}:contact:`, limit: CHUNK_LIMIT, cursor });
         const keys = list.keys || [];
         const contacts = await fetchContactsForKeys(kvService, keys, contactMap);
 
@@ -1922,7 +1923,8 @@ async function processSegmentBuildJob(message, kvService) {
             chunkIndex,
             updatedAt: new Date().toISOString()
           }, 7200);
-          await enqueueSegmentContinuation(message, kvService, cursor || resumeCursor || null, chunkIndex);
+          const continuationCursor = cursor || resumeCursor || null;
+          await enqueueSegmentContinuation(message, kvService, continuationCursor, chunkIndex);
           return;
         }
         throw chunkError;
