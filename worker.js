@@ -1844,6 +1844,11 @@ async function assignContactsToList(kvService, orgId, listId, contactIds = []) {
 }
 
 async function processSegmentBuildJob(message, kvService) {
+  const phase = message.phase || 'scan';
+  if (phase === 'update_contacts') {
+    return processSegmentUpdatePhase(message, kvService);
+  }
+
   const { orgId, segmentId, filters = [], editMode, cursor: resumeCursor, chunkIndex: resumeChunkIndex = 0 } = message;
   const statusKey = `org:${orgId}:segment_job:${segmentId}`;
   const matchesKeyPrefix = `org:${orgId}:segment_job:${segmentId}:matches`;
@@ -1934,29 +1939,35 @@ async function processSegmentBuildJob(message, kvService) {
     const matchingContactIds = await collectSegmentMatches(kvService, matchesKeyPrefix, chunkIndex);
     const uniqueIds = Array.from(new Set(matchingContactIds));
 
-    const updatedSegment = {
-      ...existingSegment,
-      contactIds: uniqueIds,
-      contactCount: uniqueIds.length,
-      lastRefreshed: new Date().toISOString(),
-      status: 'ready'
-    };
-
-    await kvService.put(segmentKey, updatedSegment);
-
     const previousContactIds = existingSegment.contactIds || [];
     const toAdd = uniqueIds.filter(id => !previousContactIds.includes(id));
     const toRemove = previousContactIds.filter(id => !uniqueIds.includes(id));
 
-    await updateContactsForSegment(kvService, orgId, contactMap, toAdd, segmentId, true);
-    await updateContactsForSegment(kvService, orgId, contactMap, toRemove, segmentId, false);
+    await kvService.setCache(`${matchesKeyPrefix}:final`, uniqueIds, 7200);
+    await kvService.setCache(`${matchesKeyPrefix}:add`, toAdd, 7200);
+    await kvService.setCache(`${matchesKeyPrefix}:remove`, toRemove, 7200);
+    await kvService.setCache(`${matchesKeyPrefix}:update_state`, {
+      addOffset: 0,
+      removeOffset: 0
+    }, 7200);
 
     await kvService.setCache(statusKey, {
-      status: 'completed',
+      status: 'queued',
+      stage: 'updating_contacts',
       segmentId,
-      matchedContacts: uniqueIds.length,
-      completedAt: new Date().toISOString()
+      editMode,
+      chunkIndex,
+      updatedAt: new Date().toISOString()
     }, 7200);
+
+    await enqueueSegmentContinuation({
+      ...message,
+      phase: 'update_contacts',
+      cursor: null,
+      chunkIndex,
+      totalMatches: uniqueIds.length
+    }, kvService, null, chunkIndex);
+    return;
   } catch (error) {
     console.error('SEGMENT BUILD FAILED:', error);
     await kvService.setCache(statusKey, {
@@ -2012,6 +2023,87 @@ async function enqueueSegmentContinuation(message, kvService, cursor, chunkIndex
     chunkIndex,
     retryCount: (message.retryCount || 0) + 1
   });
+}
+
+async function processSegmentUpdatePhase(message, kvService) {
+  const { orgId, segmentId } = message;
+  const statusKey = `org:${orgId}:segment_job:${segmentId}`;
+  const matchesKeyPrefix = `org:${orgId}:segment_job:${segmentId}:matches`;
+  const MAX_SAFE_OPS = kvService.maxOperations - 100;
+
+  const addIds = (await kvService.getCache(`${matchesKeyPrefix}:add`)) || [];
+  const removeIds = (await kvService.getCache(`${matchesKeyPrefix}:remove`)) || [];
+  const finalIds = (await kvService.getCache(`${matchesKeyPrefix}:final`)) || [];
+  const updateState = await kvService.getCache(`${matchesKeyPrefix}:update_state`) || { addOffset: 0, removeOffset: 0 };
+  const contactMap = new Map();
+  const chunkSize = 25;
+
+  if (updateState.removeOffset < removeIds.length) {
+    const ids = removeIds.slice(updateState.removeOffset, updateState.removeOffset + chunkSize);
+    await updateContactsForSegment(kvService, orgId, contactMap, ids, segmentId, false);
+    updateState.removeOffset += ids.length;
+    await kvService.setCache(`${matchesKeyPrefix}:update_state`, updateState, 7200);
+    await kvService.setCache(statusKey, {
+      status: 'processing',
+      stage: 'removing_contacts',
+      segmentId,
+      progress: {
+        removed: updateState.removeOffset,
+        totalToRemove: removeIds.length
+      },
+      updatedAt: new Date().toISOString()
+    }, 7200);
+
+    if (updateState.removeOffset < removeIds.length || kvService.operationCount >= MAX_SAFE_OPS) {
+      await enqueueSegmentContinuation({ ...message, phase: 'update_contacts' }, kvService, null, message.chunkIndex || 0);
+      return;
+    }
+  }
+
+  if (updateState.addOffset < addIds.length) {
+    const ids = addIds.slice(updateState.addOffset, updateState.addOffset + chunkSize);
+    await updateContactsForSegment(kvService, orgId, contactMap, ids, segmentId, true);
+    updateState.addOffset += ids.length;
+    await kvService.setCache(`${matchesKeyPrefix}:update_state`, updateState, 7200);
+    await kvService.setCache(statusKey, {
+      status: 'processing',
+      stage: 'adding_contacts',
+      segmentId,
+      progress: {
+        added: updateState.addOffset,
+        totalToAdd: addIds.length
+      },
+      updatedAt: new Date().toISOString()
+    }, 7200);
+
+    if (updateState.addOffset < addIds.length || kvService.operationCount >= MAX_SAFE_OPS) {
+      await enqueueSegmentContinuation({ ...message, phase: 'update_contacts' }, kvService, null, message.chunkIndex || 0);
+      return;
+    }
+  }
+
+  const segmentKey = `org:${orgId}:contactlist:${segmentId}`;
+  const existingSegment = await kvService.get(segmentKey);
+  const updatedSegment = {
+    ...existingSegment,
+    contactIds: finalIds,
+    contactCount: finalIds.length,
+    lastRefreshed: new Date().toISOString(),
+    status: 'ready'
+  };
+  await kvService.put(segmentKey, updatedSegment);
+
+  await kvService.setCache(statusKey, {
+    status: 'completed',
+    segmentId,
+    matchedContacts: finalIds.length,
+    completedAt: new Date().toISOString()
+  }, 7200);
+
+  await kvService.deleteCache(`${matchesKeyPrefix}:final`);
+  await kvService.deleteCache(`${matchesKeyPrefix}:add`);
+  await kvService.deleteCache(`${matchesKeyPrefix}:remove`);
+  await kvService.deleteCache(`${matchesKeyPrefix}:update_state`);
 }
 
 async function updateContactsForSegment(kvService, orgId, contactMap, contactIds, segmentId, add = true) {
