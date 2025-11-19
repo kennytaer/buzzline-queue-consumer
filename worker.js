@@ -1853,6 +1853,12 @@ async function processSegmentBuildJob(message, kvService) {
   const statusKey = `org:${orgId}:segment_job:${segmentId}`;
   const matchesKeyPrefix = `org:${orgId}:segment_job:${segmentId}:matches`;
 
+  const existingStatus = await kvService.getCache(statusKey);
+  if (existingStatus?.status === 'deleted') {
+    console.warn('SEGMENT BUILD - job cancelled before start', { segmentId });
+    return;
+  }
+
   await kvService.setCache(statusKey, {
     status: 'processing',
     stage: 'loading_contacts',
@@ -2052,6 +2058,16 @@ async function processSegmentUpdatePhase(message, kvService) {
   const statusKey = `org:${orgId}:segment_job:${segmentId}`;
   const matchesKeyPrefix = `org:${orgId}:segment_job:${segmentId}:matches`;
   const MAX_SAFE_OPS = kvService.maxOperations - 100;
+
+  const existingStatus = await kvService.getCache(statusKey);
+  if (existingStatus?.status === 'deleted') {
+    console.warn('SEGMENT BUILD - update phase cancelled', { segmentId });
+    await kvService.deleteCache(`${matchesKeyPrefix}:final`);
+    await kvService.deleteCache(`${matchesKeyPrefix}:add`);
+    await kvService.deleteCache(`${matchesKeyPrefix}:remove`);
+    await kvService.deleteCache(`${matchesKeyPrefix}:update_state`);
+    return;
+  }
 
   const addIds = (await kvService.getCache(`${matchesKeyPrefix}:add`)) || [];
   const removeIds = (await kvService.getCache(`${matchesKeyPrefix}:remove`)) || [];
