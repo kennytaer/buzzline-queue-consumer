@@ -1844,15 +1844,18 @@ async function assignContactsToList(kvService, orgId, listId, contactIds = []) {
 }
 
 async function processSegmentBuildJob(message, kvService) {
-  const { orgId, segmentId, filters = [], editMode } = message;
+  const { orgId, segmentId, filters = [], editMode, cursor: resumeCursor, chunkIndex: resumeChunkIndex = 0 } = message;
   const statusKey = `org:${orgId}:segment_job:${segmentId}`;
+  const matchesKeyPrefix = `org:${orgId}:segment_job:${segmentId}:matches`;
 
   await kvService.setCache(statusKey, {
     status: 'processing',
     stage: 'loading_contacts',
     segmentId,
     editMode,
-    startedAt: new Date().toISOString()
+    cursor: resumeCursor || null,
+    chunkIndex: resumeChunkIndex,
+    updatedAt: new Date().toISOString()
   }, 7200);
 
   try {
@@ -1863,16 +1866,76 @@ async function processSegmentBuildJob(message, kvService) {
       throw new Error(`Segment ${segmentId} not found for org ${orgId}`);
     }
 
-    const allContacts = await listContactsForSegmentBuild(kvService, orgId);
-    const matchingContacts = (filters && filters.length > 0)
-      ? allContacts.filter(contact => evaluateSegmentFilters(contact, filters))
-      : allContacts;
+    const MAX_SAFE_OPS = kvService.maxOperations - 100;
+    let cursor = resumeCursor || null;
+    let chunkIndex = resumeChunkIndex;
+    const contactMap = new Map();
 
-    const matchingContactIds = matchingContacts.map(contact => contact.id);
+    do {
+      try {
+        const list = await kvService.listMain({ prefix: `org:${orgId}:contact:`, limit: 200, cursor });
+        const keys = list.keys || [];
+        const contacts = await fetchContactsForKeys(kvService, keys, contactMap);
+
+        const matchingInChunk = (filters && filters.length > 0)
+          ? contacts.filter(contact => evaluateSegmentFilters(contact, filters))
+          : contacts;
+
+        if (matchingInChunk.length > 0) {
+          await kvService.setCache(`${matchesKeyPrefix}:${chunkIndex}`, matchingInChunk.map(contact => contact.id), 7200);
+          chunkIndex++;
+        }
+
+        cursor = list.list_complete ? null : list.cursor;
+
+        await kvService.setCache(statusKey, {
+          status: 'processing',
+          stage: cursor ? 'loading_contacts' : 'finalizing',
+          segmentId,
+          editMode,
+          cursor,
+          chunkIndex,
+          updatedAt: new Date().toISOString()
+        }, 7200);
+
+        if (cursor && kvService.operationCount >= MAX_SAFE_OPS) {
+          await kvService.setCache(statusKey, {
+            status: 'queued',
+            stage: 'rate_limited',
+            segmentId,
+            editMode,
+            cursor,
+            chunkIndex,
+            updatedAt: new Date().toISOString()
+          }, 7200);
+          await enqueueSegmentContinuation(message, kvService, cursor, chunkIndex);
+          return;
+        }
+      } catch (chunkError) {
+        if (chunkError instanceof Error && chunkError.message.includes('KV rate limit')) {
+          await kvService.setCache(statusKey, {
+            status: 'queued',
+            stage: 'rate_limited',
+            segmentId,
+            editMode,
+            cursor,
+            chunkIndex,
+            updatedAt: new Date().toISOString()
+          }, 7200);
+          await enqueueSegmentContinuation(message, kvService, cursor || resumeCursor || null, chunkIndex);
+          return;
+        }
+        throw chunkError;
+      }
+    } while (cursor);
+
+    const matchingContactIds = await collectSegmentMatches(kvService, matchesKeyPrefix, chunkIndex);
+    const uniqueIds = Array.from(new Set(matchingContactIds));
+
     const updatedSegment = {
       ...existingSegment,
-      contactIds: matchingContactIds,
-      contactCount: matchingContactIds.length,
+      contactIds: uniqueIds,
+      contactCount: uniqueIds.length,
       lastRefreshed: new Date().toISOString(),
       status: 'ready'
     };
@@ -1880,10 +1943,8 @@ async function processSegmentBuildJob(message, kvService) {
     await kvService.put(segmentKey, updatedSegment);
 
     const previousContactIds = existingSegment.contactIds || [];
-    const contactMap = new Map(allContacts.map(contact => [contact.id, contact]));
-
-    const toAdd = matchingContactIds.filter(id => !previousContactIds.includes(id));
-    const toRemove = previousContactIds.filter(id => !matchingContactIds.includes(id));
+    const toAdd = uniqueIds.filter(id => !previousContactIds.includes(id));
+    const toRemove = previousContactIds.filter(id => !uniqueIds.includes(id));
 
     await updateContactsForSegment(kvService, orgId, contactMap, toAdd, segmentId, true);
     await updateContactsForSegment(kvService, orgId, contactMap, toRemove, segmentId, false);
@@ -1891,8 +1952,7 @@ async function processSegmentBuildJob(message, kvService) {
     await kvService.setCache(statusKey, {
       status: 'completed',
       segmentId,
-      matchedContacts: matchingContactIds.length,
-      processedContacts: allContacts.length,
+      matchedContacts: uniqueIds.length,
       completedAt: new Date().toISOString()
     }, 7200);
   } catch (error) {
@@ -1907,29 +1967,49 @@ async function processSegmentBuildJob(message, kvService) {
   }
 }
 
-async function listContactsForSegmentBuild(kvService, orgId) {
-  const prefix = `org:${orgId}:contact:`;
-  let cursor;
+async function fetchContactsForKeys(kvService, keys, contactMap) {
   const contacts = [];
-
-  do {
-    const list = await kvService.listMain({ prefix, limit: 500, cursor });
-    const keys = list.keys || [];
-
-    for (let i = 0; i < keys.length; i += 25) {
-      const chunk = keys.slice(i, i + 25);
-      const chunkResults = await Promise.all(chunk.map(key => kvService.get(key.name)));
-      chunkResults.forEach(contact => {
-        if (contact) {
-          contacts.push(contact);
-        }
-      });
-    }
-
-    cursor = list.list_complete ? undefined : list.cursor;
-  } while (cursor);
-
+  for (let i = 0; i < keys.length; i += 25) {
+    const chunk = keys.slice(i, i + 25);
+    const chunkResults = await Promise.all(chunk.map(async key => {
+      const contact = await kvService.get(key.name);
+      if (contact) {
+        contactMap.set(contact.id, contact);
+      }
+      return contact;
+    }));
+    chunkResults.forEach(contact => {
+      if (contact) {
+        contacts.push(contact);
+      }
+    });
+  }
   return contacts;
+}
+
+async function collectSegmentMatches(kvService, matchesKeyPrefix, chunkCount) {
+  const ids = [];
+  for (let i = 0; i < chunkCount; i++) {
+    const chunk = await kvService.getCache(`${matchesKeyPrefix}:${i}`);
+    if (Array.isArray(chunk)) {
+      ids.push(...chunk);
+    }
+    await kvService.deleteCache(`${matchesKeyPrefix}:${i}`);
+  }
+  return ids;
+}
+
+async function enqueueSegmentContinuation(message, kvService, cursor, chunkIndex) {
+  const queue = kvService.env?.CONTACT_PROCESSING_QUEUE;
+  if (!queue?.send) {
+    throw new Error('Queue binding missing for segment continuation');
+  }
+  await queue.send({
+    ...message,
+    cursor,
+    chunkIndex,
+    retryCount: (message.retryCount || 0) + 1
+  });
 }
 
 async function updateContactsForSegment(kvService, orgId, contactMap, contactIds, segmentId, add = true) {
