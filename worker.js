@@ -108,7 +108,8 @@ const MESSAGE_TYPES = {
   CONTACT_DELETE: 'contact_delete',
   OPT_OUT_BATCH: 'opt_out_batch',
   BULK_DELETE_ORG_DATA: 'bulk_delete_org_data',
-  METADATA_REBUILD: 'metadata_rebuild'
+  METADATA_REBUILD: 'metadata_rebuild',
+  SEGMENT_BUILD: 'segment_build'
 };
 
 // Mailgun public docs cap default sending to roughly 300 requests per minute per domain.
@@ -1842,6 +1843,200 @@ async function assignContactsToList(kvService, orgId, listId, contactIds = []) {
   return updatedList;
 }
 
+async function processSegmentBuildJob(message, kvService) {
+  const { orgId, segmentId, filters = [], editMode } = message;
+  const statusKey = `org:${orgId}:segment_job:${segmentId}`;
+
+  await kvService.setCache(statusKey, {
+    status: 'processing',
+    stage: 'loading_contacts',
+    segmentId,
+    editMode,
+    startedAt: new Date().toISOString()
+  }, 7200);
+
+  try {
+    const segmentKey = `org:${orgId}:contactlist:${segmentId}`;
+    const existingSegment = await kvService.get(segmentKey);
+
+    if (!existingSegment) {
+      throw new Error(`Segment ${segmentId} not found for org ${orgId}`);
+    }
+
+    const allContacts = await listContactsForSegmentBuild(kvService, orgId);
+    const matchingContacts = (filters && filters.length > 0)
+      ? allContacts.filter(contact => evaluateSegmentFilters(contact, filters))
+      : allContacts;
+
+    const matchingContactIds = matchingContacts.map(contact => contact.id);
+    const updatedSegment = {
+      ...existingSegment,
+      contactIds: matchingContactIds,
+      contactCount: matchingContactIds.length,
+      lastRefreshed: new Date().toISOString(),
+      status: 'ready'
+    };
+
+    await kvService.put(segmentKey, updatedSegment);
+
+    const previousContactIds = existingSegment.contactIds || [];
+    const contactMap = new Map(allContacts.map(contact => [contact.id, contact]));
+
+    const toAdd = matchingContactIds.filter(id => !previousContactIds.includes(id));
+    const toRemove = previousContactIds.filter(id => !matchingContactIds.includes(id));
+
+    await updateContactsForSegment(kvService, orgId, contactMap, toAdd, segmentId, true);
+    await updateContactsForSegment(kvService, orgId, contactMap, toRemove, segmentId, false);
+
+    await kvService.setCache(statusKey, {
+      status: 'completed',
+      segmentId,
+      matchedContacts: matchingContactIds.length,
+      processedContacts: allContacts.length,
+      completedAt: new Date().toISOString()
+    }, 7200);
+  } catch (error) {
+    console.error('SEGMENT BUILD FAILED:', error);
+    await kvService.setCache(statusKey, {
+      status: 'failed',
+      segmentId,
+      error: error instanceof Error ? error.message : 'Segment build failed',
+      failedAt: new Date().toISOString()
+    }, 7200);
+    throw error;
+  }
+}
+
+async function listContactsForSegmentBuild(kvService, orgId) {
+  const prefix = `org:${orgId}:contact:`;
+  let cursor;
+  const contacts = [];
+
+  do {
+    const list = await kvService.listMain({ prefix, limit: 500, cursor });
+    const keys = list.keys || [];
+
+    for (let i = 0; i < keys.length; i += 25) {
+      const chunk = keys.slice(i, i + 25);
+      const chunkResults = await Promise.all(chunk.map(key => kvService.get(key.name)));
+      chunkResults.forEach(contact => {
+        if (contact) {
+          contacts.push(contact);
+        }
+      });
+    }
+
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+
+  return contacts;
+}
+
+async function updateContactsForSegment(kvService, orgId, contactMap, contactIds, segmentId, add = true) {
+  if (!contactIds || contactIds.length === 0) {
+    return;
+  }
+
+  const BATCH_SIZE = 25;
+  for (let i = 0; i < contactIds.length; i += BATCH_SIZE) {
+    const batch = contactIds.slice(i, i + BATCH_SIZE);
+    await Promise.all(batch.map(async contactId => {
+      let contact = contactMap.get(contactId);
+      if (!contact) {
+        contact = await kvService.get(`org:${orgId}:contact:${contactId}`);
+        if (!contact) {
+          return;
+        }
+      }
+
+      const lists = Array.isArray(contact.contactListIds) ? contact.contactListIds : [];
+      const hasSegment = lists.includes(segmentId);
+
+      if (add && hasSegment) {
+        return;
+      }
+      if (!add && !hasSegment) {
+        return;
+      }
+
+      const updatedLists = add
+        ? [...lists, segmentId]
+        : lists.filter(id => id !== segmentId);
+
+      const updatedContact = {
+        ...contact,
+        contactListIds: updatedLists,
+        updatedAt: new Date().toISOString()
+      };
+
+      await kvService.put(`org:${orgId}:contact:${contactId}`, updatedContact);
+      contactMap.set(contactId, updatedContact);
+    }));
+  }
+}
+
+function evaluateSegmentFilters(contact, filters) {
+  if (!filters || filters.length === 0) {
+    return true;
+  }
+
+  let result = evaluateSegmentRule(contact, filters[0]);
+  for (let i = 1; i < filters.length; i++) {
+    const ruleResult = evaluateSegmentRule(contact, filters[i]);
+    if (filters[i].logic === 'OR') {
+      result = result || ruleResult;
+    } else {
+      result = result && ruleResult;
+    }
+  }
+  return result;
+}
+
+function evaluateSegmentRule(contact, rule) {
+  const targetField = rule.field;
+  let contactValue;
+
+  if (['firstName', 'lastName', 'email', 'phone'].includes(targetField)) {
+    contactValue = contact[targetField] || '';
+  } else if (targetField === 'optedOut') {
+    contactValue = contact.optedOut ? 'true' : 'false';
+  } else {
+    contactValue = contact.metadata?.[targetField] || '';
+  }
+
+  const contactStr = String(contactValue ?? '').toLowerCase();
+  const filterStr = String(rule.value ?? '').toLowerCase();
+
+  switch (rule.operator) {
+    case 'equals':
+      return contactStr === filterStr;
+    case 'not_equals':
+      return contactStr !== filterStr;
+    case 'contains':
+      return contactStr.includes(filterStr);
+    case 'not_contains':
+      return !contactStr.includes(filterStr);
+    case 'starts_with':
+      return contactStr.startsWith(filterStr);
+    case 'ends_with':
+      return contactStr.endsWith(filterStr);
+    case 'greater_than':
+      return parseFloat(contactValue) > parseFloat(rule.value);
+    case 'less_than':
+      return parseFloat(contactValue) < parseFloat(rule.value);
+    case 'greater_equal':
+      return parseFloat(contactValue) >= parseFloat(rule.value);
+    case 'less_equal':
+      return parseFloat(contactValue) <= parseFloat(rule.value);
+    case 'is_empty':
+      return !contactValue || contactValue === '';
+    case 'is_not_empty':
+      return !!contactValue && contactValue !== '';
+    default:
+      return false;
+  }
+}
+
 async function checkAndFinalizeBatch(kvService, orgId, uploadId, listId, totalBatches) {
   try {
     // Check if all batches are completed
@@ -1963,6 +2158,9 @@ export default {
         case MESSAGE_TYPES.METADATA_REBUILD:
           estimatedOps = 900; // Force sequential processing
           break;
+        case MESSAGE_TYPES.SEGMENT_BUILD:
+          estimatedOps = 800;
+          break;
         default:
           estimatedOps = 100;
       }
@@ -2026,6 +2224,9 @@ export default {
                 break;
               case MESSAGE_TYPES.METADATA_REBUILD:
                 await processMetadataRebuildJob(message.body, kvService);
+                break;
+              case MESSAGE_TYPES.SEGMENT_BUILD:
+                await processSegmentBuildJob(message.body, kvService);
                 break;
               default:
                 throw new Error(`Unknown message type: ${message.body.type}`);
@@ -2119,6 +2320,9 @@ export default {
               break;
             case MESSAGE_TYPES.METADATA_REBUILD:
               await processMetadataRebuildJob(message.body, kvService);
+              break;
+            case MESSAGE_TYPES.SEGMENT_BUILD:
+              await processSegmentBuildJob(message.body, kvService);
               break;
             default:
               throw new Error(`Unknown message type: ${message.body.type}`);
